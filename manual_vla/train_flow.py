@@ -54,9 +54,9 @@ def get_intent_embedding_vector(act_str="pick_place", src_str="red", dst_str="gr
     raw_vec = np.concatenate([act_onehot, src_onehot, dst_onehot]) # 20 dims
     return raw_vec
 
-# Normalization constants for 4D actions (X, Y, Z, Gripper)
-ACTION_MEAN = torch.tensor([0.207, 0.005, 0.089, 0.516], dtype=torch.float32)
-ACTION_STD  = torch.tensor([0.034, 0.081, 0.035, 0.500], dtype=torch.float32)
+# Normalization constants for 4D actions (X, Y, Z, Gripper) matching empirical dataset
+ACTION_MEAN = torch.tensor([0.2066, 0.0024, 0.0738, 0.2617], dtype=torch.float32)
+ACTION_STD  = torch.tensor([0.0326, 0.0816, 0.0405, 0.4396], dtype=torch.float32)
 
 # -----------------------------------------------------------------------------
 # 1. Optimal Transport Dataset
@@ -247,7 +247,9 @@ def train(epochs=120, batch_size=16, lr=1.8e-3):
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
-    loss_fn = nn.MSELoss()
+    loss_fn = nn.SmoothL1Loss(reduction='none') # Huber loss
+    # Weighting: X, Y, Z spatial accuracy + 2.5x boosting on gripper grasp/release transitions
+    dim_weights = torch.tensor([1.0, 1.0, 1.2, 2.5], device=DEVICE).view(1, 1, 4)
 
     print(f"\n>> Training Flow-Matching across {len(dataset)} trajectories ({epochs} epochs)...", flush=True)
     best_loss = float('inf')
@@ -266,15 +268,18 @@ def train(epochs=120, batch_size=16, lr=1.8e-3):
                 t = torch.rand(B, device=img_b.device)
                 t_expand = t.view(B, 1, 1)
 
-                # Optimal Transport interpolation
+                # Optimal Transport path interpolation
                 x_t = (1.0 - t_expand) * traj_x0 + t_expand * x_1
                 target_v = x_1 - traj_x0
 
                 pred_v = model.forward_flow(x_t, t, img_b, intent_vec=intent_b)
-                loss = loss_fn(pred_v, target_v)
-                loss.backward()
+                # Huber loss with gripper boosting
+                raw_loss = loss_fn(pred_v, target_v) # [B, horizon, 4]
+                weighted_loss = (raw_loss * dim_weights).mean()
+                
+                weighted_loss.backward()
                 optimizer.step()
-                total_loss += loss.item() * B
+                total_loss += weighted_loss.item() * B
 
             scheduler.step()
             avg_loss = total_loss / len(dataset)
