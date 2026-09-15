@@ -315,4 +315,5 @@ def train(epochs=120, batch_size=16, lr=1.8e-3):
     print(f"\n[SUCCESS] Manual VLA checkpoint saved -> {model_path}", flush=True)
 
 if __name__ == "__main__":
-    train()
+    epochs = int(sys.argv[1]) if len(sys.argv) > 1 else 250
+    train(epochs=epochs)

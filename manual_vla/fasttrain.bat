@@ -4,17 +4,11 @@ echo ===================================================
 echo     FAST TRAIN PIPELINE: MANUAL VLA (DOBOT 4-DOF)
 echo ===================================================
 
-echo [1/3] Generating demonstration episodes...
-python auto_generate_demos.py 40
+echo [1/2] Generating demonstration episodes (80 episodes)...
+python auto_generate_demos.py 80
 
-echo [2/3] Training Flow Matching Policy (Hadamard MLP)...
-python train_flow.py
-
-echo [3/3] Cleaning up temporary demonstration dataset...
-if exist "data\demos" (
-    del /q "data\demos\*.npz" 2>nul
-    echo Demonstration cache cleared successfully.
-)
+echo [2/2] Training Flow Matching Policy (Hadamard MLP, 300 epochs)...
+python train_flow.py 300
 
 echo ===================================================
 echo  Training complete! Weights saved in models/
