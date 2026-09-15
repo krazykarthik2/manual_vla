@@ -123,10 +123,18 @@ class ResBlock(nn.Module):
     def forward(self, x):
         return x + self.conv(x)
 
+class CoordConv(nn.Module):
+    """Appends normalized (x, y) spatial coordinate channels [-1, 1] to input feature maps."""
+    def forward(self, x):
+        B, _, H, W = x.size()
+        xx_channel = torch.linspace(-1, 1, W, device=x.device).view(1, 1, 1, W).expand(B, 1, H, W)
+        yy_channel = torch.linspace(-1, 1, H, device=x.device).view(1, 1, H, 1).expand(B, 1, H, W)
+        return torch.cat([x, xx_channel, yy_channel], dim=1)
+
 class ManualVLAPolicy(nn.Module):
     """
     Lightweight Vision-Action Policy with Hadamard Conditioning:
-    - High-Resolution Patch / ResNet Visual Extractor
+    - High-Resolution CoordConv Patch / ResNet Visual Extractor (keeps spatial grounding)
     - Intent Embedder (No heavy LLM needed; takes action, src, dst embeddings)
     - Hadamard Product Feature Modulation (Image Patches * Intent Tokens)
     - Continuous Optimal Transport Flow Matching Vector Field
@@ -137,9 +145,10 @@ class ManualVLAPolicy(nn.Module):
         self.action_dim = action_dim
         self.total_act_dim = horizon * action_dim
 
-        # 1. Vision Patch / ResBlock Encoder (64x64 -> 256)
+        # 1. Vision Patch / ResBlock Encoder with CoordConv (64x64 -> 256)
+        self.coord_conv = CoordConv()
         self.visual_encoder = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1), # 32x32
+            nn.Conv2d(3 + 2, 32, kernel_size=3, stride=2, padding=1), # 32x32
             nn.BatchNorm2d(32),
             nn.GELU(),
             ResBlock(32),
@@ -147,11 +156,12 @@ class ManualVLAPolicy(nn.Module):
             nn.BatchNorm2d(64),
             nn.GELU(),
             ResBlock(64),
-            nn.Conv2d(64, 128, kernel_size=1),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1), # 8x8
             nn.BatchNorm2d(128),
             nn.GELU(),
-            nn.AdaptiveAvgPool2d((4, 4)),
-            nn.Flatten() # 128 * 16 = 2048
+            ResBlock(128),
+            nn.AdaptiveAvgPool2d((4, 4)), # 4x4 x 128 = 2048
+            nn.Flatten()
         )
         self.v_proj = nn.Linear(2048, 256)
 
@@ -187,15 +197,16 @@ class ManualVLAPolicy(nn.Module):
 
     def forward_flow(self, x_t, t, img, intent_vec):
         B = img.size(0)
-        v_feat = self.v_proj(self.visual_encoder(img)) # [B, 256]
-        i_feat = self.intent_mlp(intent_vec)           # [B, 256]
+        img_coord = self.coord_conv(img)
+        v_feat = self.v_proj(self.visual_encoder(img_coord)) # [B, 256]
+        i_feat = self.intent_mlp(intent_vec)                 # [B, 256]
 
         # Hadamard modulation on visual features
-        modulated_v = v_feat * i_feat                  # [B, 256]
-        cond = torch.cat([modulated_v, i_feat], dim=-1) # [B, 512]
+        modulated_v = v_feat * i_feat                        # [B, 256]
+        cond = torch.cat([modulated_v, i_feat], dim=-1)      # [B, 512]
 
-        t_feat = self.time_embed(t)                    # [B, 128]
-        x_flat = x_t.reshape(B, -1)                    # [B, 512]
+        t_feat = self.time_embed(t)                          # [B, 128]
+        x_flat = x_t.reshape(B, -1)                          # [B, 512]
 
         inp = torch.cat([x_flat, cond, t_feat], dim=-1)
         v_pred = self.flow_net(inp)

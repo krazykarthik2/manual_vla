@@ -10,4 +10,3 @@ if exist "vla_model.pth" (
     echo vla_model.pth deleted.
 )
 echo Model cleanup complete.
-pause

@@ -7,4 +7,3 @@ if exist "data\demos" (
 ) else (
     echo data\demos directory does not exist.
 )
-pause

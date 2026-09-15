@@ -19,4 +19,3 @@ if exist "data\demos" (
 echo ===================================================
 echo  Training complete! Weights saved in models/
 echo ===================================================
-pause

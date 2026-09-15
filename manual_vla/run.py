@@ -93,14 +93,22 @@ def run_gui():
 
             if current_trajectory is not None and traj_step < len(current_trajectory):
                 target_point = current_trajectory[traj_step]
-                traj_step += 1
                 
-                # Smooth velocity interpolation
-                delta_x = target_point[0] - sim.ee_pos[0]
-                delta_y = target_point[1] - sim.ee_pos[1]
-                delta_z = target_point[2] - sim.ee_pos[2]
-                delta_action = np.array([delta_x, delta_y, delta_z, 0.0, target_point[3]], dtype=np.float32)
-                obs, success = sim.step_delta(delta_action, max_step=0.008)
+                # Closed-loop tracking: step end-effector towards target waypoint with max 0.010m per tick
+                diff_xyz = target_point[:3] - sim.ee_pos[:3]
+                dist_to_pt = np.linalg.norm(diff_xyz)
+                
+                # Advance to next waypoint once current waypoint is reached within 0.008m or after progress
+                if dist_to_pt < 0.008:
+                    traj_step += 1
+                    if traj_step < len(current_trajectory):
+                        target_point = current_trajectory[traj_step]
+                        diff_xyz = target_point[:3] - sim.ee_pos[:3]
+                else:
+                    traj_step += 1 # Steadily progress along the trajectory
+                
+                delta_action = np.array([diff_xyz[0], diff_xyz[1], diff_xyz[2], 0.0, target_point[3]], dtype=np.float32)
+                obs, success = sim.step_delta(delta_action, max_step=0.010)
 
         # -------------------------------------------------------------
         # 4-Panel Rendering
