@@ -172,14 +172,14 @@ def run_auto_demonstrator(num_demos=60, base_delay=0.001):
         
         if act_choice == "pick_place":
             stages = [
-                (f"1. Approach {sim.target_color.upper()} Cube", p_start, p_hover_cube, 0.0, 0.0, 20),
+                (f"1. Approach {sim.target_color.upper()} Cube", p_start, p_hover_cube, 0.0, 0.0, 24),
                 (f"2. Descend on {sim.target_color.upper()} Cube", p_hover_cube, np.array([target_start[0], target_start[1], 0.026], dtype=np.float32), 0.0, 0.0, 16),
-                (f"3. Grasp {sim.target_color.upper()} Cube", np.array([target_start[0], target_start[1], 0.026], dtype=np.float32), np.array([target_start[0], target_start[1], 0.026], dtype=np.float32), 1.0, 0.0, 4),
+                (f"3. Grasp {sim.target_color.upper()} Cube", np.array([target_start[0], target_start[1], 0.026], dtype=np.float32), np.array([target_start[0], target_start[1], 0.026], dtype=np.float32), 1.0, 0.0, 6),
                 (f"4. Lift {sim.target_color.upper()} Cube", np.array([target_start[0], target_start[1], 0.026], dtype=np.float32), p_hover_cube, 1.0, 0.0, 16),
-                (f"5. Carry to {sim.target_plat_color.upper()} Box", p_hover_cube, np.array([platform_target[0], platform_target[1], hover_cube_z], dtype=np.float32), 1.0, 0.0, 24),
+                (f"5. Carry to {sim.target_plat_color.upper()} Box", p_hover_cube, np.array([platform_target[0], platform_target[1], hover_cube_z], dtype=np.float32), 1.0, 0.0, 28),
                 (f"6. Lower to {sim.target_plat_color.upper()} Box", np.array([platform_target[0], platform_target[1], hover_cube_z], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), 1.0, 0.0, 16),
                 (f"7. Release {sim.target_color.upper()} Cube", np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), 0.0, 1.0, 6),
-                ("8. Retract Arm (Task Done)", np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.12], dtype=np.float32), 0.0, 1.0, 12),
+                ("8. Retract Arm (Task Done)", np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.12], dtype=np.float32), 0.0, 1.0, 16),
             ]
         else: # "push"
             push_dir = (platform_target[:2] - target_start[:2])
@@ -192,11 +192,11 @@ def run_auto_demonstrator(num_demos=60, base_delay=0.001):
             push_dest = target_start[:2] + push_dir * 0.085
 
             stages = [
-                (f"1. Move Behind {sim.target_color.upper()} Cube", p_start, np.array([behind_pos[0], behind_pos[1], 0.080], dtype=np.float32), 0.0, 0.0, 20),
-                (f"2. Lower Behind {sim.target_color.upper()} Cube", np.array([behind_pos[0], behind_pos[1], 0.080], dtype=np.float32), np.array([behind_pos[0], behind_pos[1], 0.020], dtype=np.float32), 0.0, 0.0, 14),
-                (f"3. Push Toward {sim.target_plat_color.upper()}", np.array([behind_pos[0], behind_pos[1], 0.020], dtype=np.float32), np.array([push_dest[0], push_dest[1], 0.020], dtype=np.float32), 0.0, 0.0, 36),
-                (f"4. Retract Gripper", np.array([push_dest[0], push_dest[1], 0.020], dtype=np.float32), np.array([push_dest[0], push_dest[1], 0.100], dtype=np.float32), 0.0, 1.0, 14),
-                (f"5. Return Home", np.array([push_dest[0], push_dest[1], 0.100], dtype=np.float32), np.array([0.20, 0.0, 0.12], dtype=np.float32), 0.0, 1.0, 16),
+                (f"1. Move Behind {sim.target_color.upper()} Cube", p_start, np.array([behind_pos[0], behind_pos[1], 0.080], dtype=np.float32), 0.0, 0.0, 24),
+                (f"2. Lower Behind {sim.target_color.upper()} Cube", np.array([behind_pos[0], behind_pos[1], 0.080], dtype=np.float32), np.array([behind_pos[0], behind_pos[1], 0.020], dtype=np.float32), 0.0, 0.0, 16),
+                (f"3. Push Toward {sim.target_plat_color.upper()}", np.array([behind_pos[0], behind_pos[1], 0.020], dtype=np.float32), np.array([push_dest[0], push_dest[1], 0.020], dtype=np.float32), 0.0, 0.0, 40),
+                (f"4. Retract Gripper", np.array([push_dest[0], push_dest[1], 0.020], dtype=np.float32), np.array([push_dest[0], push_dest[1], 0.100], dtype=np.float32), 0.0, 1.0, 16),
+                (f"5. Return Home", np.array([push_dest[0], push_dest[1], 0.100], dtype=np.float32), np.array([0.20, 0.0, 0.12], dtype=np.float32), 0.0, 1.0, 20),
             ]
 
         for stage_name, start_pt, end_pt, grip_state, succ_state, steps in stages:

@@ -131,10 +131,39 @@ class CoordConv(nn.Module):
         yy_channel = torch.linspace(-1, 1, H, device=x.device).view(1, 1, H, 1).expand(B, 1, H, W)
         return torch.cat([x, xx_channel, yy_channel], dim=1)
 
+class SpatialSoftmax(nn.Module):
+    """
+    Spatial Softmax layer that converts 2D feature maps directly into continuous
+    sub-pixel (x, y) coordinate keypoints, preserving exact object positions.
+    """
+    def __init__(self, temperature=None):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, features):
+        B, C, H, W = features.shape
+        if self.temperature is not None:
+            features = features / self.temperature
+
+        # Compute spatial softmax across (H, W)
+        features_flat = features.view(B, C, H * W)
+        softmax_attention = F.softmax(features_flat, dim=-1).view(B, C, H, W)
+
+        # Coordinate grid [-1, 1]
+        pos_x = torch.linspace(-1, 1, W, device=features.device).view(1, 1, 1, W)
+        pos_y = torch.linspace(-1, 1, H, device=features.device).view(1, 1, H, 1)
+
+        expected_x = torch.sum(softmax_attention * pos_x, dim=(-2, -1)) # [B, C]
+        expected_y = torch.sum(softmax_attention * pos_y, dim=(-2, -1)) # [B, C]
+
+        keypoints = torch.cat([expected_x, expected_y], dim=-1) # [B, 2*C]
+        return keypoints
+
 class ManualVLAPolicy(nn.Module):
     """
-    Lightweight Vision-Action Policy with Hadamard Conditioning:
-    - High-Resolution CoordConv Patch / ResNet Visual Extractor (keeps spatial grounding)
+    Lightweight Vision-Action Policy with Spatial Softmax + Hadamard Conditioning:
+    - High-Resolution CoordConv ResNet Visual Extractor
+    - Spatial Softmax Keypoint Bottleneck (preserves sub-pixel continuous coordinates)
     - Intent Embedder (No heavy LLM needed; takes action, src, dst embeddings)
     - Hadamard Product Feature Modulation (Image Patches * Intent Tokens)
     - Continuous Optimal Transport Flow Matching Vector Field
@@ -145,9 +174,9 @@ class ManualVLAPolicy(nn.Module):
         self.action_dim = action_dim
         self.total_act_dim = horizon * action_dim
 
-        # 1. Vision Patch / ResBlock Encoder with CoordConv (64x64 -> 256)
+        # 1. Vision Patch / ResBlock Encoder with CoordConv & Spatial Softmax
         self.coord_conv = CoordConv()
-        self.visual_encoder = nn.Sequential(
+        self.conv_stem = nn.Sequential(
             nn.Conv2d(3 + 2, 32, kernel_size=3, stride=2, padding=1), # 32x32
             nn.BatchNorm2d(32),
             nn.GELU(),
@@ -156,14 +185,16 @@ class ManualVLAPolicy(nn.Module):
             nn.BatchNorm2d(64),
             nn.GELU(),
             ResBlock(64),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1), # 8x8
-            nn.BatchNorm2d(128),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1), # 16x16
+            nn.BatchNorm2d(64),
             nn.GELU(),
-            ResBlock(128),
-            nn.AdaptiveAvgPool2d((4, 4)), # 4x4 x 128 = 2048
-            nn.Flatten()
         )
-        self.v_proj = nn.Linear(2048, 256)
+        self.spatial_softmax = SpatialSoftmax() # 64 channels * 2 (x, y) = 128 keypoints
+        self.v_proj = nn.Sequential(
+            nn.Linear(128, 256),
+            nn.GELU(),
+            nn.Linear(256, 256)
+        )
 
         # 2. Intent Parameter MLP
         self.intent_mlp = nn.Sequential(
@@ -195,10 +226,15 @@ class ManualVLAPolicy(nn.Module):
             nn.Linear(512, self.total_act_dim)
         )
 
+    def extract_visual_features(self, img):
+        img_coord = self.coord_conv(img)
+        feat_map = self.conv_stem(img_coord)
+        keypoints = self.spatial_softmax(feat_map)
+        return self.v_proj(keypoints)
+
     def forward_flow(self, x_t, t, img, intent_vec):
         B = img.size(0)
-        img_coord = self.coord_conv(img)
-        v_feat = self.v_proj(self.visual_encoder(img_coord)) # [B, 256]
+        v_feat = self.extract_visual_features(img)            # [B, 256]
         i_feat = self.intent_mlp(intent_vec)                 # [B, 256]
 
         # Hadamard modulation on visual features

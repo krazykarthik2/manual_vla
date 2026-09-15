@@ -107,7 +107,9 @@ def run_gui():
                 else:
                     traj_step += 1 # Steadily progress along the trajectory
                 
-                delta_action = np.array([diff_xyz[0], diff_xyz[1], diff_xyz[2], 0.0, target_point[3]], dtype=np.float32)
+                # Binary sharpening of continuous gripper signal
+                grip_cmd = 1.0 if target_point[3] > 0.45 else 0.0
+                delta_action = np.array([diff_xyz[0], diff_xyz[1], diff_xyz[2], 0.0, grip_cmd], dtype=np.float32)
                 obs, success = sim.step_delta(delta_action, max_step=0.010)
 
         # -------------------------------------------------------------
@@ -266,7 +268,7 @@ def run_gui():
         screen.blit(font_sm.render(status_text, True, (130, 140, 160)), (105, 520))
 
         pygame.display.flip()
-        clock.tick(30)
+        clock.tick(60)
 
     pygame.quit()
 
