@@ -81,7 +81,8 @@ def run_gui():
                         img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)
                         intent_raw = get_intent_embedding_vector(action_type, sim.target_color, sim.target_plat_color)
                         intent_t = torch.tensor(intent_raw, dtype=torch.float32).unsqueeze(0)
-                        current_trajectory = model.sample(img_t, intent_t, num_steps=20).squeeze(0).numpy()
+                        proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0)
+                        current_trajectory = model.sample(img_t, intent_t, proprio=proprio_t, num_steps=20).squeeze(0).numpy()
                         traj_step = 0
                 else:
                     c_pos = sim.target_cube_pos

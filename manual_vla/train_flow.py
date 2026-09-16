@@ -84,7 +84,8 @@ class OTFlowMatchingDataset(Dataset):
 
             raw_traj = np.concatenate([proprio[:, :3], acts[:, 4:5]], axis=-1) # [128, 4]
             norm_traj = (torch.tensor(raw_traj, dtype=torch.float32) - ACTION_MEAN) / (ACTION_STD + 1e-6)
-            self.samples.append((img0, intent_vec, norm_traj))
+            proprio0 = proprio[0] # [5] (x, y, z, yaw, gripper)
+            self.samples.append((img0, intent_vec, proprio0, norm_traj))
 
         print(f">> Successfully indexed {len(self.samples)} trajectory demonstrations.", flush=True)
 
@@ -92,8 +93,8 @@ class OTFlowMatchingDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img, intent_vec, norm_traj = self.samples[idx]
-        return torch.tensor(img, dtype=torch.float32), torch.tensor(intent_vec, dtype=torch.float32), norm_traj
+        img, intent_vec, proprio0, norm_traj = self.samples[idx]
+        return torch.tensor(img, dtype=torch.float32), torch.tensor(intent_vec, dtype=torch.float32), torch.tensor(proprio0, dtype=torch.float32), norm_traj
 
 # -----------------------------------------------------------------------------
 # 2. Vision Patch & Flow Matching Policy Architecture
@@ -203,7 +204,14 @@ class ManualVLAPolicy(nn.Module):
             nn.Linear(128, 256)
         )
 
-        # 3. Continuous Time Embedding
+        # 3. Proprioception State MLP (x, y, z, yaw, gripper -> 64)
+        self.proprio_mlp = nn.Sequential(
+            nn.Linear(5, 64),
+            nn.GELU(),
+            nn.Linear(64, 64)
+        )
+
+        # 4. Continuous Time Embedding
         self.time_embed = nn.Sequential(
             SinusoidalTimeEmbedding(64),
             nn.Linear(64, 128),
@@ -211,10 +219,10 @@ class ManualVLAPolicy(nn.Module):
             nn.Linear(128, 128)
         )
 
-        # 4. Flow Matching Vector Field Network
-        # Condition size: 256 (Hadamard vision*intent) + 256 (intent) = 512 + 128 (time) = 640
+        # 5. Flow Matching Vector Field Network
+        # Condition size: 256 (Hadamard vision*intent) + 256 (intent) + 64 (proprio) = 576 + 128 (time) = 704
         self.flow_net = nn.Sequential(
-            nn.Linear(self.total_act_dim + 512 + 128, 512),
+            nn.Linear(self.total_act_dim + 576 + 128, 512),
             nn.LayerNorm(512),
             nn.GELU(),
             nn.Linear(512, 512),
@@ -232,14 +240,20 @@ class ManualVLAPolicy(nn.Module):
         keypoints = self.spatial_softmax(feat_map)
         return self.v_proj(keypoints)
 
-    def forward_flow(self, x_t, t, img, intent_vec):
+    def forward_flow(self, x_t, t, img, intent_vec, proprio=None):
         B = img.size(0)
         v_feat = self.extract_visual_features(img)            # [B, 256]
         i_feat = self.intent_mlp(intent_vec)                 # [B, 256]
 
+        if proprio is None:
+            proprio = torch.zeros(B, 5, device=img.device)
+        elif proprio.dim() == 1:
+            proprio = proprio.unsqueeze(0)
+        p_feat = self.proprio_mlp(proprio)                   # [B, 64]
+
         # Hadamard modulation on visual features
         modulated_v = v_feat * i_feat                        # [B, 256]
-        cond = torch.cat([modulated_v, i_feat], dim=-1)      # [B, 512]
+        cond = torch.cat([modulated_v, i_feat, p_feat], dim=-1) # [B, 576]
 
         t_feat = self.time_embed(t)                          # [B, 128]
         x_flat = x_t.reshape(B, -1)                          # [B, 512]
@@ -249,7 +263,7 @@ class ManualVLAPolicy(nn.Module):
         return v_pred.reshape(B, self.horizon, self.action_dim)
 
     @torch.no_grad()
-    def sample(self, img, intent_vec, num_steps=20):
+    def sample(self, img, intent_vec, proprio=None, num_steps=20):
         """Continuous Euler ODE integration from noise to predicted robot trajectory."""
         B = img.size(0)
         x = torch.randn(B, self.horizon, self.action_dim, device=img.device)
@@ -257,7 +271,7 @@ class ManualVLAPolicy(nn.Module):
 
         for i in range(num_steps):
             t = torch.full((B,), (i + 0.5) * dt, device=img.device)
-            v = self.forward_flow(x, t, img, intent_vec)
+            v = self.forward_flow(x, t, img, intent_vec, proprio=proprio)
             x = x - v * dt
 
         raw_x = x * ACTION_STD.to(img.device) + ACTION_MEAN.to(img.device)
@@ -307,7 +321,7 @@ def train(epochs=120, batch_size=16, lr=1.8e-3):
             model.train()
             total_loss = 0.0
 
-            for img_b, intent_b, traj_x0 in dataloader:
+            for img_b, intent_b, proprio_b, traj_x0 in dataloader:
                 B = img_b.size(0)
                 optimizer.zero_grad(set_to_none=True)
 
@@ -319,7 +333,7 @@ def train(epochs=120, batch_size=16, lr=1.8e-3):
                 x_t = (1.0 - t_expand) * traj_x0 + t_expand * x_1
                 target_v = x_1 - traj_x0
 
-                pred_v = model.forward_flow(x_t, t, img_b, intent_vec=intent_b)
+                pred_v = model.forward_flow(x_t, t, img_b, intent_vec=intent_b, proprio=proprio_b)
                 # Huber loss with gripper boosting
                 raw_loss = loss_fn(pred_v, target_v) # [B, horizon, 4]
                 weighted_loss = (raw_loss * dim_weights).mean()
@@ -350,6 +364,130 @@ def train(epochs=120, batch_size=16, lr=1.8e-3):
     torch.save(model.state_dict(), model_path)
     print(f"\n[SUCCESS] Manual VLA checkpoint saved -> {model_path}", flush=True)
 
+# -----------------------------------------------------------------------------
+# 4. Reinforcement Learning Fine-Tuning (Environment in the Loop)
+# -----------------------------------------------------------------------------
+def compute_episode_reward(sim, trajectory, action_type):
+    plat_pos = sim.target_platform_pos.copy()
+    min_dist_to_cube = float('inf')
+    min_dist_to_plat = float('inf')
+    grasped_at_any_point = False
+    task_succeeded = False
+
+    for pt in trajectory:
+        diff = pt[:3] - sim.ee_pos[:3]
+        grip_cmd = 1.0 if pt[3] > 0.45 else 0.0
+        act = np.array([diff[0], diff[1], diff[2], 0.0, grip_cmd], dtype=np.float32)
+        obs, is_succ = sim.step_delta(act, max_step=0.010)
+
+        d_cube = np.linalg.norm(sim.ee_pos[:3] - sim.target_cube_pos)
+        min_dist_to_cube = min(min_dist_to_cube, d_cube)
+
+        if sim.grasped:
+            grasped_at_any_point = True
+            d_plat = np.linalg.norm(sim.target_cube_pos[:2] - plat_pos[:2])
+            min_dist_to_plat = min(min_dist_to_plat, d_plat)
+
+        if is_succ:
+            task_succeeded = True
+            break
+
+    # Dense reward shaping:
+    # 1. Approach bonus: max +10 if within grasp reach
+    r_approach = max(0.0, (0.20 - min_dist_to_cube) / 0.20) * 10.0
+    # 2. Grasp bonus: +25 if cube successfully secured
+    r_grasp = 25.0 if grasped_at_any_point else 0.0
+    # 3. Transport bonus: max +15 if transported to platform
+    r_transport = 0.0
+    if grasped_at_any_point:
+        r_transport = max(0.0, (0.25 - min_dist_to_plat) / 0.25) * 15.0
+    # 4. Terminal success bonus: +50
+    r_success = 50.0 if task_succeeded else 0.0
+
+    total_reward = r_approach + r_grasp + r_transport + r_success
+    return total_reward, task_succeeded, grasped_at_any_point, min_dist_to_cube
+
+def rl_finetune(num_episodes=150, lr=2e-5, update_every=4):
+    sys.path.append(os.path.join(os.path.dirname(__file__), "env"))
+    from dobot_env import DobotPickPlaceSim
+
+    print("=" * 68, flush=True)
+    print("   MANUAL VLA POLICY: REINFORCEMENT LEARNING FINE-TUNING", flush=True)
+    print("   - Initialized from Pretrained Flow-Matching Weights", flush=True)
+    print("   - Proprioception-Conditioned Policy: Current EE -> Action Chunk", flush=True)
+    print("   - Environment-in-the-Loop Policy Gradient Optimization", flush=True)
+    print("=" * 68, flush=True)
+
+    sim = DobotPickPlaceSim()
+    model = ManualVLAPolicy().to(DEVICE)
+    model_path = os.path.join(MODEL_DIR, "dobot_bc_policy.pth")
+
+    if os.path.exists(model_path):
+        try:
+            model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+            print(f">> Loaded pre-trained weights from {model_path}", flush=True)
+        except Exception as e:
+            print(f">> Starting fresh ({e})", flush=True)
+
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+
+    running_baseline = 10.0
+    best_success_rate = 0.0
+    recent_successes = []
+
+    for ep in range(1, num_episodes + 1):
+        action_type = "pick_place" if (ep % 2 == 0) else "push"
+        obs = sim.reset(random_scene=True, num_distractors=2, action_type=action_type)
+
+        img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        intent_raw = get_intent_embedding_vector(action_type, sim.target_color, sim.target_plat_color)
+        intent_t = torch.tensor(intent_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0).to(DEVICE)
+
+        with torch.no_grad():
+            clean_traj = model.sample(img_t, intent_t, proprio=proprio_t, num_steps=20).squeeze(0)
+
+        noise = torch.randn_like(clean_traj) * 0.012
+        exp_traj_t = clean_traj + noise
+        exp_traj = exp_traj_t.cpu().numpy()
+
+        reward, succ, grasped, min_d = compute_episode_reward(sim, exp_traj, action_type)
+        recent_successes.append(1.0 if succ else (0.5 if grasped else 0.0))
+        if len(recent_successes) > 20:
+            recent_successes.pop(0)
+
+        advantage = reward - running_baseline
+        running_baseline = 0.95 * running_baseline + 0.05 * reward
+
+        t_rand = torch.rand(1, device=DEVICE)
+        x_target = exp_traj_t.unsqueeze(0)
+        v_pred = model.forward_flow(x_target, t_rand, img_t, intent_t, proprio=proprio_t)
+
+        flow_reg = torch.mean(v_pred**2)
+        loss = -torch.clamp(torch.tensor(advantage, device=DEVICE), -15.0, 30.0) * flow_reg * 0.01
+
+        loss.backward()
+
+        if ep % update_every == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        succ_pct = sum(recent_successes) / len(recent_successes) * 100.0
+        print(f"EP {ep:03d}/{num_episodes} | Act: {action_type[:4].upper()} | MinDist: {min_d*1000:.1f}mm | Grasped: {grasped} | Succ: {succ} | R: {reward:.1f} | Adv: {advantage:+.1f} | Window Rate: {succ_pct:.1f}%", flush=True)
+
+        if ep % 25 == 0 or succ_pct > best_success_rate:
+            best_success_rate = max(best_success_rate, succ_pct)
+            torch.save(model.state_dict(), model_path)
+
+    torch.save(model.state_dict(), model_path)
+    print(f"\n[DONE] RL Fine-tuning complete. Model checkpoint saved -> {model_path}", flush=True)
+
 if __name__ == "__main__":
-    epochs = int(sys.argv[1]) if len(sys.argv) > 1 else 250
-    train(epochs=epochs)
+    mode = sys.argv[1] if len(sys.argv) > 1 else "train"
+    if mode == "rl":
+        episodes = int(sys.argv[2]) if len(sys.argv) > 2 else 150
+        rl_finetune(num_episodes=episodes)
+    else:
+        epochs = int(sys.argv[1]) if len(sys.argv) > 1 else 250
+        train(epochs=epochs)
