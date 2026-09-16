@@ -124,143 +124,158 @@ class ResBlock(nn.Module):
     def forward(self, x):
         return x + self.conv(x)
 
-class CoordConv(nn.Module):
-    """Appends normalized (x, y) spatial coordinate channels [-1, 1] to input feature maps."""
-    def forward(self, x):
-        B, _, H, W = x.size()
-        xx_channel = torch.linspace(-1, 1, W, device=x.device).view(1, 1, 1, W).expand(B, 1, H, W)
-        yy_channel = torch.linspace(-1, 1, H, device=x.device).view(1, 1, H, 1).expand(B, 1, H, W)
-        return torch.cat([x, xx_channel, yy_channel], dim=1)
-
-class SpatialSoftmax(nn.Module):
-    """
-    Spatial Softmax layer that converts 2D feature maps directly into continuous
-    sub-pixel (x, y) coordinate keypoints, preserving exact object positions.
-    """
-    def __init__(self, temperature=None):
+class Sinusoidal2DPositionalEmbedding(nn.Module):
+    """2D Positional Embeddings for 16x16 visual patch grid."""
+    def __init__(self, dim=128, grid_size=16):
         super().__init__()
-        self.temperature = temperature
+        self.dim = dim
+        self.grid_size = grid_size
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim // 4, dtype=torch.float32) / (dim // 4)))
+        
+        pos_x = torch.arange(grid_size, dtype=torch.float32)
+        pos_y = torch.arange(grid_size, dtype=torch.float32)
+        
+        sin_x = torch.sin(pos_x.unsqueeze(1) * inv_freq.unsqueeze(0))
+        cos_x = torch.cos(pos_x.unsqueeze(1) * inv_freq.unsqueeze(0))
+        sin_y = torch.sin(pos_y.unsqueeze(1) * inv_freq.unsqueeze(0))
+        cos_y = torch.cos(pos_y.unsqueeze(1) * inv_freq.unsqueeze(0))
+        
+        # [16, 16, dim]
+        pe = torch.zeros(grid_size, grid_size, dim)
+        pe[:, :, 0::4] = sin_x.unsqueeze(1).repeat(1, grid_size, 1)
+        pe[:, :, 1::4] = cos_x.unsqueeze(1).repeat(1, grid_size, 1)
+        pe[:, :, 2::4] = sin_y.unsqueeze(0).repeat(grid_size, 1, 1)
+        pe[:, :, 3::4] = cos_y.unsqueeze(0).repeat(grid_size, 1, 1)
+        
+        self.register_buffer("pe", pe.view(grid_size * grid_size, dim).unsqueeze(0)) # [1, 256, dim]
 
-    def forward(self, features):
-        B, C, H, W = features.shape
-        if self.temperature is not None:
-            features = features / self.temperature
+    def forward(self, x):
+        return x + self.pe
 
-        # Compute spatial softmax across (H, W)
-        features_flat = features.view(B, C, H * W)
-        softmax_attention = F.softmax(features_flat, dim=-1).view(B, C, H, W)
+class CrossAttentionBlock(nn.Module):
+    """Transformer Decoder Block with Self-Attention and Visual Cross-Attention."""
+    def __init__(self, d_model=128, nhead=4, d_ff=256):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Linear(d_ff, d_model)
+        )
 
-        # Coordinate grid [-1, 1]
-        pos_x = torch.linspace(-1, 1, W, device=features.device).view(1, 1, 1, W)
-        pos_y = torch.linspace(-1, 1, H, device=features.device).view(1, 1, H, 1)
-
-        expected_x = torch.sum(softmax_attention * pos_x, dim=(-2, -1)) # [B, C]
-        expected_y = torch.sum(softmax_attention * pos_y, dim=(-2, -1)) # [B, C]
-
-        keypoints = torch.cat([expected_x, expected_y], dim=-1) # [B, 2*C]
-        return keypoints
+    def forward(self, tgt, memory):
+        # 1. Self Attention
+        tgt2, _ = self.self_attn(tgt, tgt, tgt)
+        tgt = self.norm1(tgt + tgt2)
+        
+        # 2. Cross Attention to visual & goal tokens
+        tgt2, attn_weights = self.cross_attn(tgt, memory, memory)
+        tgt = self.norm2(tgt + tgt2)
+        
+        # 3. Feed Forward
+        tgt = self.norm3(tgt + self.ffn(tgt))
+        return tgt, attn_weights
 
 class ManualVLAPolicy(nn.Module):
     """
-    Lightweight Vision-Action Policy with Spatial Softmax + Hadamard Conditioning:
-    - High-Resolution CoordConv ResNet Visual Extractor
-    - Spatial Softmax Keypoint Bottleneck (preserves sub-pixel continuous coordinates)
-    - Intent Embedder (No heavy LLM needed; takes action, src, dst embeddings)
-    - Hadamard Product Feature Modulation (Image Patches * Intent Tokens)
-    - Continuous Optimal Transport Flow Matching Vector Field
+    True Vision-Language-Action Cross-Attention Transformer Policy (ACT-style):
+    - 256 Visual Patch Tokens (16x16 grid from 4x4 patches on 64x64 top camera)
+    - 2D Sinusoidal Positional Embeddings
+    - Goal & Intent Tokenizer (Action type, Target Cube color, Destination platform)
+    - Proprioception State Tokenizer (live x, y, z, yaw, gripper)
+    - Cross-Attention Transformer Decoder with Flow Matching Action Head
     """
-    def __init__(self, raw_intent_dim=20, horizon=128, action_dim=4):
+    def __init__(self, raw_intent_dim=20, horizon=128, action_dim=4, d_model=128, num_layers=4):
         super().__init__()
         self.horizon = horizon
         self.action_dim = action_dim
-        self.total_act_dim = horizon * action_dim
-
-        # 1. Vision Patch / ResBlock Encoder with CoordConv & Spatial Softmax
-        self.coord_conv = CoordConv()
-        self.conv_stem = nn.Sequential(
-            nn.Conv2d(3 + 2, 32, kernel_size=3, stride=2, padding=1), # 32x32
-            nn.BatchNorm2d(32),
+        self.d_model = d_model
+        
+        # 1. Visual Tokenizer (64x64 image -> 16x16 grid of 4x4 patches = 256 tokens)
+        self.patch_embed = nn.Conv2d(3, d_model, kernel_size=4, stride=4) # [B, d_model, 16, 16]
+        self.pos_embed = Sinusoidal2DPositionalEmbedding(d_model, grid_size=16)
+        
+        # 2. Intent and Proprioception Tokenizers
+        self.intent_proj = nn.Sequential(
+            nn.Linear(raw_intent_dim, d_model),
             nn.GELU(),
-            ResBlock(32),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), # 16x16
-            nn.BatchNorm2d(64),
-            nn.GELU(),
-            ResBlock(64),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1), # 16x16
-            nn.BatchNorm2d(64),
-            nn.GELU(),
+            nn.Linear(d_model, d_model)
         )
-        self.spatial_softmax = SpatialSoftmax() # 64 channels * 2 (x, y) = 128 keypoints
-        self.v_proj = nn.Sequential(
-            nn.Linear(128, 256),
+        self.proprio_proj = nn.Sequential(
+            nn.Linear(5, d_model),
             nn.GELU(),
-            nn.Linear(256, 256)
+            nn.Linear(d_model, d_model)
         )
-
-        # 2. Intent Parameter MLP
-        self.intent_mlp = nn.Sequential(
-            nn.Linear(raw_intent_dim, 128),
-            nn.GELU(),
-            nn.Linear(128, 256)
-        )
-
-        # 3. Proprioception State MLP (x, y, z, yaw, gripper -> 64)
-        self.proprio_mlp = nn.Sequential(
-            nn.Linear(5, 64),
-            nn.GELU(),
-            nn.Linear(64, 64)
-        )
-
-        # 4. Continuous Time Embedding
+        
+        # 3. Continuous Time Embedding
         self.time_embed = nn.Sequential(
             SinusoidalTimeEmbedding(64),
-            nn.Linear(64, 128),
+            nn.Linear(64, d_model),
             nn.GELU(),
-            nn.Linear(128, 128)
+            nn.Linear(d_model, d_model)
+        )
+        
+        # 4. Action Query Tokens & Cross-Attention Transformer
+        self.action_in_proj = nn.Linear(action_dim, d_model)
+        self.pos_queries = nn.Parameter(torch.randn(1, horizon, d_model) * 0.02)
+        
+        self.layers = nn.ModuleList([
+            CrossAttentionBlock(d_model=d_model, nhead=4, d_ff=d_model * 2)
+            for _ in range(num_layers)
+        ])
+        
+        # 5. Output Flow Vector Field Head
+        self.out_head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, action_dim)
         )
 
-        # 5. Flow Matching Vector Field Network
-        # Condition size: 256 (Hadamard vision*intent) + 256 (intent) + 64 (proprio) = 576 + 128 (time) = 704
-        self.flow_net = nn.Sequential(
-            nn.Linear(self.total_act_dim + 576 + 128, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Linear(512, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Linear(512, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Linear(512, self.total_act_dim)
-        )
-
-    def extract_visual_features(self, img):
-        img_coord = self.coord_conv(img)
-        feat_map = self.conv_stem(img_coord)
-        keypoints = self.spatial_softmax(feat_map)
-        return self.v_proj(keypoints)
+    def extract_visual_tokens(self, img):
+        B = img.size(0)
+        patches = self.patch_embed(img) # [B, d_model, 16, 16]
+        tokens = patches.flatten(2).permute(0, 2, 1) # [B, 256, d_model]
+        tokens = self.pos_embed(tokens)
+        return tokens
 
     def forward_flow(self, x_t, t, img, intent_vec, proprio=None):
         B = img.size(0)
-        v_feat = self.extract_visual_features(img)            # [B, 256]
-        i_feat = self.intent_mlp(intent_vec)                 # [B, 256]
-
+        
+        # 1. Visual tokens (256 tokens)
+        vis_tokens = self.extract_visual_tokens(img) # [B, 256, d_model]
+        
+        # 2. Context tokens (Intent + Proprioception + Time)
+        i_token = self.intent_proj(intent_vec).unsqueeze(1) # [B, 1, d_model]
+        
         if proprio is None:
             proprio = torch.zeros(B, 5, device=img.device)
         elif proprio.dim() == 1:
             proprio = proprio.unsqueeze(0)
-        p_feat = self.proprio_mlp(proprio)                   # [B, 64]
-
-        # Hadamard modulation on visual features
-        modulated_v = v_feat * i_feat                        # [B, 256]
-        cond = torch.cat([modulated_v, i_feat, p_feat], dim=-1) # [B, 576]
-
-        t_feat = self.time_embed(t)                          # [B, 128]
-        x_flat = x_t.reshape(B, -1)                          # [B, 512]
-
-        inp = torch.cat([x_flat, cond, t_feat], dim=-1)
-        v_pred = self.flow_net(inp)
-        return v_pred.reshape(B, self.horizon, self.action_dim)
+        p_token = self.proprio_proj(proprio).unsqueeze(1) # [B, 1, d_model]
+        
+        t_token = self.time_embed(t).unsqueeze(1) # [B, 1, d_model]
+        
+        # Full Memory Sequence for Cross-Attention: 256 + 3 = 259 tokens
+        memory = torch.cat([i_token, p_token, t_token, vis_tokens], dim=1) # [B, 259, d_model]
+        
+        # 3. Action Sequence Queries
+        act_tokens = self.action_in_proj(x_t) + self.pos_queries # [B, horizon, d_model]
+        
+        # 4. Cross-Attention Transformer Layers
+        x = act_tokens
+        for layer in self.layers:
+            x, attn_weights = layer(x, memory)
+            
+        # 5. Predict vector field for each timestep in horizon
+        v_pred = self.out_head(x) # [B, horizon, action_dim]
+        return v_pred
 
     @torch.no_grad()
     def sample(self, img, intent_vec, proprio=None, num_steps=20):
@@ -276,13 +291,12 @@ class ManualVLAPolicy(nn.Module):
 
         raw_x = x * ACTION_STD.to(img.device) + ACTION_MEAN.to(img.device)
         
-        # Temporal smoothing filter across horizon to eliminate high-frequency micro-jitter
-        # Box filter smoothing over window of 5 timesteps
+        # Temporal smoothing filter across horizon
         kernel = torch.ones(1, 1, 5, device=img.device) / 5.0
-        # raw_x shape: [B, horizon, 4] -> permute to [B*4, 1, horizon]
         raw_perm = raw_x.permute(0, 2, 1).reshape(B * self.action_dim, 1, self.horizon)
         smoothed = F.conv1d(raw_perm, kernel, padding=2)
         smoothed = smoothed.view(B, self.action_dim, self.horizon).permute(0, 2, 1)
+        return smoothed
 
         return smoothed
 
