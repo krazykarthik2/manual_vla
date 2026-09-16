@@ -308,7 +308,7 @@ TrueSmolVLAPolicy = ManualVLAPolicy
 # -----------------------------------------------------------------------------
 def train(epochs=120, batch_size=16, lr=1.8e-3):
     print("=" * 68, flush=True)
-    print("   Manual VLA Flow-Matching Policy Training (Hadamard MLP)", flush=True)
+    print("   Manual VLA Flow-Matching Policy Training (Cross-Attention Transformer)", flush=True)
     print("   - Action Conditioning: Pick & Place vs Push", flush=True)
     print("   - Patch Visual Extractor & Parameterized Embeddings", flush=True)
     print("   - Optimal Transport Vector Field Regression | 100% CPU", flush=True)
@@ -459,6 +459,12 @@ def rl_finetune(num_episodes=500, lr=2e-5, update_every=4, target_success_rate=9
         except Exception as e:
             print(f">> Starting fresh ({e})", flush=True)
 
+    # Demo anchor dataset to prevent catastrophic forgetting
+    demo_dataset = OTFlowMatchingDataset(DATA_DIR)
+    demo_loader = DataLoader(demo_dataset, batch_size=4, shuffle=True)
+    demo_iter = iter(demo_loader)
+    loss_fn = nn.SmoothL1Loss(reduction='mean')
+
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
     running_baseline = 10.0
@@ -484,7 +490,7 @@ def rl_finetune(num_episodes=500, lr=2e-5, update_every=4, target_success_rate=9
             clean_traj = model.sample(img_t, intent_t, proprio=proprio_t, num_steps=20).squeeze(0)
 
         # Subtle exploration noise (decaying as policy matures)
-        noise_std = max(0.005, 0.012 * (0.998 ** ep))
+        noise_std = max(0.004, 0.010 * (0.998 ** ep))
         noise = torch.randn_like(clean_traj) * noise_std
         exp_traj_t = clean_traj + noise
         exp_traj = exp_traj_t.cpu().numpy()
@@ -497,14 +503,41 @@ def rl_finetune(num_episodes=500, lr=2e-5, update_every=4, target_success_rate=9
         advantage = reward - running_baseline
         running_baseline = 0.95 * running_baseline + 0.05 * reward
 
+        # 1. Flow-Matching Loss on current exploration trajectory (weighted by advantage)
         t_rand = torch.rand(1, device=DEVICE)
         x_target = exp_traj_t.unsqueeze(0)
-        v_pred = model.forward_flow(x_target, t_rand, img_t, intent_t, proprio=proprio_t)
+        # Reconstruct vector field from random noise to target trajectory
+        x_noise = torch.randn_like(x_target)
+        x_interp = (1.0 - t_rand.view(1, 1, 1)) * x_target + t_rand.view(1, 1, 1) * x_noise
+        v_target = x_noise - x_target
+        v_pred = model.forward_flow(x_interp, t_rand, img_t, intent_t, proprio=proprio_t)
 
-        flow_reg = torch.mean(v_pred**2)
-        loss = -torch.clamp(torch.tensor(advantage, device=DEVICE), -15.0, 30.0) * flow_reg * 0.01
+        flow_l2 = loss_fn(v_pred, v_target)
+        # Reinforce positive advantage trajectories; penalize bad moves
+        adv_clipped = float(np.clip(advantage, -20.0, 30.0))
+        # Positive advantage -> guide towards explored trajectory; Negative advantage -> move away
+        rl_loss = - (adv_clipped / 30.0) * flow_l2 * 0.5
 
-        loss.backward()
+        # 2. Demonstration Replay Anchor (Behavioral Regularization):
+        # Keeps policy grounded in clean human/expert demos so RL doesn't collapse or drift
+        try:
+            d_img, d_intent, d_proprio, d_traj = next(demo_iter)
+        except StopIteration:
+            demo_iter = iter(demo_loader)
+            d_img, d_intent, d_proprio, d_traj = next(demo_iter)
+
+        d_B = d_img.size(0)
+        d_noise = torch.randn_like(d_traj)
+        d_t = torch.rand(d_B, device=DEVICE)
+        d_t_exp = d_t.view(d_B, 1, 1)
+        d_interp = (1.0 - d_t_exp) * d_traj + d_t_exp * d_noise
+        d_v_target = d_noise - d_traj
+        d_v_pred = model.forward_flow(d_interp, d_t, d_img, intent_vec=d_intent, proprio=d_proprio)
+        demo_loss = loss_fn(d_v_pred, d_v_target)
+
+        # Combined Loss: 70% Grounded in Demonstrations + 30% RL Performance Optimization
+        total_loss = demo_loss * 0.70 + rl_loss * 0.30
+        total_loss.backward()
 
         if ep % update_every == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
