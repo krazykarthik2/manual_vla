@@ -386,36 +386,41 @@ def compute_episode_reward(sim, trajectory, action_type):
     min_dist_to_cube = float('inf')
     min_dist_to_plat = float('inf')
     grasped_at_any_point = False
-    task_succeeded = False
 
+    # Execute full trajectory to completion without premature termination
     for pt in trajectory:
         diff = pt[:3] - sim.ee_pos[:3]
         grip_cmd = 1.0 if pt[3] > 0.45 else 0.0
         act = np.array([diff[0], diff[1], diff[2], 0.0, grip_cmd], dtype=np.float32)
-        obs, is_succ = sim.step_delta(act, max_step=0.010)
+        obs, _ = sim.step_delta(act, max_step=0.010)
 
         d_cube = np.linalg.norm(sim.ee_pos[:3] - sim.target_cube_pos)
         min_dist_to_cube = min(min_dist_to_cube, d_cube)
 
         if sim.grasped:
             grasped_at_any_point = True
-            d_plat = np.linalg.norm(sim.target_cube_pos[:2] - plat_pos[:2])
-            min_dist_to_plat = min(min_dist_to_plat, d_plat)
 
-        if is_succ:
-            task_succeeded = True
-            break
+        # Monitor distance between target cube and target platform
+        d_plat = np.linalg.norm(sim.target_cube_pos[:2] - plat_pos[:2])
+        min_dist_to_plat = min(min_dist_to_plat, d_plat)
+
+    # Assess final physical placement: is the right cube on top of the right platform?
+    # Platform radius is 0.035m, cube on platform has z <= 0.025m, and gripper released
+    final_cube_dist_to_plat = np.linalg.norm(sim.target_cube_pos[:2] - plat_pos[:2])
+    task_succeeded = bool(
+        final_cube_dist_to_plat < 0.040 and
+        sim.target_cube_pos[2] <= 0.025 and
+        not sim.gripper_closed
+    )
 
     # Dense reward shaping:
     # 1. Approach bonus: max +10 if within grasp reach
     r_approach = max(0.0, (0.20 - min_dist_to_cube) / 0.20) * 10.0
-    # 2. Grasp bonus: +25 if cube successfully secured
+    # 2. Grasp bonus: +25 if target cube successfully held
     r_grasp = 25.0 if grasped_at_any_point else 0.0
-    # 3. Transport bonus: max +15 if transported to platform
-    r_transport = 0.0
-    if grasped_at_any_point:
-        r_transport = max(0.0, (0.25 - min_dist_to_plat) / 0.25) * 15.0
-    # 4. Terminal success bonus: +50
+    # 3. Transport bonus: max +20 if brought to destination platform
+    r_transport = max(0.0, (0.25 - final_cube_dist_to_plat) / 0.25) * 20.0
+    # 4. Success bonus: +50 when right thing is on top of right platform
     r_success = 50.0 if task_succeeded else 0.0
 
     total_reward = r_approach + r_grasp + r_transport + r_success

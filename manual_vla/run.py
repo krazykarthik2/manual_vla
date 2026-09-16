@@ -55,6 +55,9 @@ def run_gui():
     traj_step = 0
     auto_execute = True
 
+    success_banner_timer = 0
+    task_success_status = None
+
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -64,18 +67,21 @@ def run_gui():
                     action_type = "pick_place"
                     sim.action_type = action_type
                     current_trajectory = None
+                    task_success_status = None
                 elif event.key == pygame.K_2:
                     action_type = "push"
                     sim.action_type = action_type
                     current_trajectory = None
+                    task_success_status = None
                 elif event.key == pygame.K_r:
                     obs = sim.reset(random_scene=True, num_distractors=2, action_type=action_type)
                     current_trajectory = None
+                    task_success_status = None
                 elif event.key == pygame.K_SPACE:
                     auto_execute = not auto_execute
 
         if auto_execute:
-            if current_trajectory is None or traj_step >= len(current_trajectory):
+            if current_trajectory is None:
                 if has_model:
                     with torch.no_grad():
                         img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)
@@ -84,6 +90,7 @@ def run_gui():
                         proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0)
                         current_trajectory = model.sample(img_t, intent_t, proprio=proprio_t, num_steps=20).squeeze(0).numpy()
                         traj_step = 0
+                        task_success_status = None
                 else:
                     c_pos = sim.target_cube_pos
                     p_pos = sim.target_platform_pos
@@ -92,7 +99,7 @@ def run_gui():
                     delta = np.clip(target_xyz - sim.ee_pos[:3], -0.008, 0.008)
                     obs, _ = sim.step_delta(np.array([delta[0], delta[1], delta[2], 0.0, grip], dtype=np.float32))
 
-            if current_trajectory is not None and traj_step < len(current_trajectory):
+            elif traj_step < len(current_trajectory):
                 target_point = current_trajectory[traj_step]
                 
                 # Closed-loop tracking: step end-effector towards target waypoint with max 0.010m per tick
@@ -111,7 +118,24 @@ def run_gui():
                 # Binary sharpening of continuous gripper signal
                 grip_cmd = 1.0 if target_point[3] > 0.45 else 0.0
                 delta_action = np.array([diff_xyz[0], diff_xyz[1], diff_xyz[2], 0.0, grip_cmd], dtype=np.float32)
-                obs, success = sim.step_delta(delta_action, max_step=0.010)
+                obs, _ = sim.step_delta(delta_action, max_step=0.010)
+            else:
+                # Full trajectory completed: evaluate if the right cube is resting on top of the right platform
+                if task_success_status is None:
+                    final_cube_dist_to_plat = np.linalg.norm(sim.target_cube_pos[:2] - sim.target_platform_pos[:2])
+                    task_success_status = bool(
+                        final_cube_dist_to_plat < 0.040 and
+                        sim.target_cube_pos[2] <= 0.025 and
+                        not sim.gripper_closed
+                    )
+                    success_banner_timer = 45 # Display result for 45 frames before next trial
+                elif success_banner_timer > 0:
+                    success_banner_timer -= 1
+                else:
+                    # Reset scene for the next autonomous trial
+                    obs = sim.reset(random_scene=True, num_distractors=2, action_type=action_type)
+                    current_trajectory = None
+                    task_success_status = None
 
         # -------------------------------------------------------------
         # 4-Panel Rendering
@@ -265,8 +289,18 @@ def run_gui():
         screen.blit(font_bold.render("CONTROLS:", True, (120, 210, 255)), (25, 490))
         controls_text = "[1] Action: Pick & Place   |   [2] Action: Push   |   [R] Randomize   |   [SPACE] Pause/Play"
         screen.blit(font.render(controls_text, True, (200, 205, 220)), (105, 491))
-        status_text = f"Status: {'AUTONOMOUS' if auto_execute else 'PAUSED'}  |  Dobot 4-DOF IK: Active  |  High-Res Tokens: 256 (16x16)"
-        screen.blit(font_sm.render(status_text, True, (130, 140, 160)), (105, 520))
+
+        if task_success_status is not None and success_banner_timer > 0:
+            if task_success_status:
+                eval_text = "EVALUATION: SUCCESS - TARGET CUBE ON PLATFORM!"
+                eval_col = (50, 240, 100)
+            else:
+                eval_text = "EVALUATION: INCOMPLETE / MISPLACED"
+                eval_col = (255, 90, 90)
+            screen.blit(font_bold.render(eval_text, True, eval_col), (105, 520))
+        else:
+            status_text = f"Status: {'AUTONOMOUS' if auto_execute else 'PAUSED'}  |  Dobot 4-DOF IK: Active  |  Tokens: 256"
+            screen.blit(font_sm.render(status_text, True, (130, 140, 160)), (105, 520))
 
         pygame.display.flip()
         clock.tick(60)
@@ -275,3 +309,4 @@ def run_gui():
 
 if __name__ == "__main__":
     run_gui()
+
