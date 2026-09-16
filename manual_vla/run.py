@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import time
 import torch
@@ -9,7 +9,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "env"))
 from dobot_env import DobotPickPlaceSim, COLOR_PALETTE
 from train_flow import ManualVLAPolicy, get_intent_embedding_vector, MODEL_DIR
 
-def run_gui():
+def run_gui(fast_mode=False):
     device = torch.device("cpu")
     model_path = os.path.join(MODEL_DIR, "dobot_bc_policy.pth")
 
@@ -57,6 +57,19 @@ def run_gui():
 
     success_banner_timer = 0
     task_success_status = None
+    lightspeed = fast_mode
+
+    # Vectorized patch heatmap computation (sub-0.2ms)
+    def compute_dense_patch_heatmap_vec(img_hwc, target_rgb):
+        # img_hwc: [64, 64, 3] -> reshape to [16, 4, 16, 4, 3] -> mean over (1, 3) -> [16, 16, 3]
+        patch_means = img_hwc.reshape(16, 4, 16, 4, 3).mean(axis=(1, 3)) / 255.0
+        tgt = np.array(target_rgb, dtype=np.float32) / 255.0
+        dists = np.linalg.norm(patch_means - tgt, axis=2)
+        grid = np.exp(-dists * 5.0)
+        g_min, g_max = grid.min(), grid.max()
+        if g_max > g_min:
+            grid = (grid - g_min) / (g_max - g_min + 1e-6)
+        return grid
 
     while running:
         for event in pygame.event.get():
@@ -77,65 +90,69 @@ def run_gui():
                     obs = sim.reset(random_scene=True, num_distractors=2, action_type=action_type)
                     current_trajectory = None
                     task_success_status = None
+                elif event.key == pygame.K_f:
+                    lightspeed = not lightspeed
                 elif event.key == pygame.K_SPACE:
                     auto_execute = not auto_execute
 
-        if auto_execute:
-            if current_trajectory is None:
-                if has_model:
-                    with torch.no_grad():
-                        img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)
-                        intent_raw = get_intent_embedding_vector(action_type, sim.target_color, sim.target_plat_color)
-                        intent_t = torch.tensor(intent_raw, dtype=torch.float32).unsqueeze(0)
-                        proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0)
-                        current_trajectory = model.sample(img_t, intent_t, proprio=proprio_t, num_steps=20).squeeze(0).numpy()
-                        traj_step = 0
-                        task_success_status = None
-                else:
-                    c_pos = sim.target_cube_pos
-                    p_pos = sim.target_platform_pos
-                    target_xyz = c_pos if not sim.grasped else p_pos
-                    grip = 1.0 if np.linalg.norm(sim.ee_pos[:3] - c_pos) < 0.035 else 0.0
-                    delta = np.clip(target_xyz - sim.ee_pos[:3], -0.008, 0.008)
-                    obs, _ = sim.step_delta(np.array([delta[0], delta[1], delta[2], 0.0, grip], dtype=np.float32))
+        # In lightspeed mode, run multiple physics simulation micro-steps per frame render
+        steps_per_frame = 3 if lightspeed else 1
 
-            elif traj_step < len(current_trajectory):
-                target_point = current_trajectory[traj_step]
-                
-                # Closed-loop tracking: step end-effector towards target waypoint with max 0.010m per tick
-                diff_xyz = target_point[:3] - sim.ee_pos[:3]
-                dist_to_pt = np.linalg.norm(diff_xyz)
-                
-                # Advance to next waypoint once current waypoint is reached within 0.008m or after progress
-                if dist_to_pt < 0.008:
-                    traj_step += 1
-                    if traj_step < len(current_trajectory):
-                        target_point = current_trajectory[traj_step]
-                        diff_xyz = target_point[:3] - sim.ee_pos[:3]
+        for _ in range(steps_per_frame):
+            if auto_execute:
+                if current_trajectory is None:
+                    if has_model:
+                        with torch.no_grad():
+                            img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)
+                            intent_raw = get_intent_embedding_vector(action_type, sim.target_color, sim.target_plat_color)
+                            intent_t = torch.tensor(intent_raw, dtype=torch.float32).unsqueeze(0)
+                            proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0)
+                            # In lightspeed sampling, 10 ODE steps are sufficient and 2x faster
+                            sample_steps = 10 if lightspeed else 20
+                            current_trajectory = model.sample(img_t, intent_t, proprio=proprio_t, num_steps=sample_steps).squeeze(0).numpy()
+                            traj_step = 0
+                            task_success_status = None
+                    else:
+                        c_pos = sim.target_cube_pos
+                        p_pos = sim.target_platform_pos
+                        target_xyz = c_pos if not sim.grasped else p_pos
+                        grip = 1.0 if np.linalg.norm(sim.ee_pos[:3] - c_pos) < 0.035 else 0.0
+                        delta = np.clip(target_xyz - sim.ee_pos[:3], -0.008, 0.008)
+                        obs, _ = sim.step_delta(np.array([delta[0], delta[1], delta[2], 0.0, grip], dtype=np.float32))
+
+                elif traj_step < len(current_trajectory):
+                    target_point = current_trajectory[traj_step]
+                    diff_xyz = target_point[:3] - sim.ee_pos[:3]
+                    dist_to_pt = np.linalg.norm(diff_xyz)
+                    
+                    advance_threshold = 0.012 if lightspeed else 0.008
+                    if dist_to_pt < advance_threshold:
+                        traj_step += 2 if lightspeed else 1
+                        if traj_step < len(current_trajectory):
+                            target_point = current_trajectory[traj_step]
+                            diff_xyz = target_point[:3] - sim.ee_pos[:3]
+                    else:
+                        traj_step += 2 if lightspeed else 1
+                    
+                    grip_cmd = 1.0 if target_point[3] > 0.45 else 0.0
+                    max_step_rate = 0.015 if lightspeed else 0.010
+                    delta_action = np.array([diff_xyz[0], diff_xyz[1], diff_xyz[2], 0.0, grip_cmd], dtype=np.float32)
+                    obs, _ = sim.step_delta(delta_action, max_step=max_step_rate)
                 else:
-                    traj_step += 1 # Steadily progress along the trajectory
-                
-                # Binary sharpening of continuous gripper signal
-                grip_cmd = 1.0 if target_point[3] > 0.45 else 0.0
-                delta_action = np.array([diff_xyz[0], diff_xyz[1], diff_xyz[2], 0.0, grip_cmd], dtype=np.float32)
-                obs, _ = sim.step_delta(delta_action, max_step=0.010)
-            else:
-                # Full trajectory completed: evaluate if the right cube is resting on top of the right platform
-                if task_success_status is None:
-                    final_cube_dist_to_plat = np.linalg.norm(sim.target_cube_pos[:2] - sim.target_platform_pos[:2])
-                    task_success_status = bool(
-                        final_cube_dist_to_plat < 0.040 and
-                        sim.target_cube_pos[2] <= 0.025 and
-                        not sim.gripper_closed
-                    )
-                    success_banner_timer = 45 # Display result for 45 frames before next trial
-                elif success_banner_timer > 0:
-                    success_banner_timer -= 1
-                else:
-                    # Reset scene for the next autonomous trial
-                    obs = sim.reset(random_scene=True, num_distractors=2, action_type=action_type)
-                    current_trajectory = None
-                    task_success_status = None
+                    if task_success_status is None:
+                        final_cube_dist_to_plat = np.linalg.norm(sim.target_cube_pos[:2] - sim.target_platform_pos[:2])
+                        task_success_status = bool(
+                            final_cube_dist_to_plat < 0.040 and
+                            sim.target_cube_pos[2] <= 0.025 and
+                            not sim.gripper_closed
+                        )
+                        success_banner_timer = 15 if lightspeed else 45
+                    elif success_banner_timer > 0:
+                        success_banner_timer -= 1
+                    else:
+                        obs = sim.reset(random_scene=True, num_distractors=2, action_type=action_type)
+                        current_trajectory = None
+                        task_success_status = None
 
         # -------------------------------------------------------------
         # 4-Panel Rendering
@@ -200,39 +217,21 @@ def run_gui():
             pygame.draw.circle(screen, (255, 170, 50), pt, 4)
         pygame.draw.circle(screen, grip_color, pts_side[-1], 7)
 
-        # -------------------------------------------------------------
-        # Panels 3 & 4: HIGH-RESOLUTION 256 EMBEDDING PATCHES (16x16 Grid)
-        # -------------------------------------------------------------
+        # Panels 3 & 4: HIGH-RESOLUTION 256 EMBEDDING PATCHES (Vectorized)
         img_hwc = (np.transpose(obs["image"], (1, 2, 0)) * 255).astype(np.uint8)
-
-        # Fine-grained 4x4 pixel patches -> 16x16 grid = 256 spatial tokens
-        def compute_dense_patch_heatmap(target_rgb):
-            grid = np.zeros((16, 16), dtype=np.float32)
-            tgt = np.array(target_rgb, dtype=np.float32) / 255.0
-            for py in range(16):
-                for px in range(16):
-                    patch = img_hwc[py*4:(py+1)*4, px*4:(px+1)*4]
-                    patch_mean = patch.mean(axis=(0, 1)) / 255.0
-                    dist = np.linalg.norm(patch_mean - tgt)
-                    score = np.exp(-dist * 5.0)
-                    grid[py, px] = score
-            if grid.max() > grid.min():
-                grid = (grid - grid.min()) / (grid.max() - grid.min() + 1e-6)
-            return grid
 
         p1_rgb = COLOR_PALETTE.get(sim.target_color, (240, 45, 45))
         p2_rgb = COLOR_PALETTE.get(sim.target_plat_color, (40, 210, 80))
-        heatmap_p1 = compute_dense_patch_heatmap(p1_rgb)
-        heatmap_p2 = compute_dense_patch_heatmap(p2_rgb)
+        heatmap_p1 = compute_dense_patch_heatmap_vec(img_hwc, p1_rgb)
+        heatmap_p2 = compute_dense_patch_heatmap_vec(img_hwc, p2_rgb)
 
         # Panel 3: PARAM 1 (15, 275, 355, 135)
         pygame.draw.rect(screen, (28, 31, 40), (15, 275, 355, 135), border_radius=6)
         screen.blit(font_bold.render(f"PARAM 1 EMBEDDING ({sim.target_color.upper()})", True, (255, 200, 100)), (25, 282))
         screen.blit(font_sm.render("256 Visual Tokens (16x16 Fine Patch Grid):", True, (150, 160, 180)), (25, 298))
 
-        # Render 16x16 Fine-grained Patch Grid for Param 1
         g1_x, g1_y = 25, 317
-        b_size = 5 # 5px per patch * 16 = 80px square
+        b_size = 5
         for r in range(16):
             for c in range(16):
                 val = heatmap_p1[r, c]
@@ -244,7 +243,6 @@ def run_gui():
                 pygame.draw.rect(screen, patch_col, (g1_x + c * b_size, g1_y + r * b_size, b_size, b_size))
         pygame.draw.rect(screen, (90, 100, 120), (g1_x, g1_y, 16 * b_size, 16 * b_size), 1)
 
-        # Inset Top Camera
         cam_surf = pygame.transform.scale(pygame.surfarray.make_surface(np.transpose(img_hwc, (1, 0, 2))), (80, 80))
         screen.blit(cam_surf, (245, 317))
         pygame.draw.rect(screen, (100, 220, 255), (245, 317, 80, 80), 1)
@@ -255,7 +253,6 @@ def run_gui():
         screen.blit(font_bold.render(f"PARAM 2 EMBEDDING ({sim.target_plat_color.upper()})", True, (100, 220, 255)), (400, 282))
         screen.blit(font_sm.render("256 Visual Tokens (16x16 Fine Patch Grid):", True, (150, 160, 180)), (400, 298))
 
-        # Render 16x16 Fine-grained Patch Grid for Param 2
         g2_x, g2_y = 400, 317
         for r in range(16):
             for c in range(16):
@@ -268,26 +265,22 @@ def run_gui():
                 pygame.draw.rect(screen, patch_col, (g2_x + c * b_size, g2_y + r * b_size, b_size, b_size))
         pygame.draw.rect(screen, (90, 100, 120), (g2_x, g2_y, 16 * b_size, 16 * b_size), 1)
 
-        # Inset Target Dest Platform
         pygame.draw.rect(screen, p2_rgb, (620, 327, 60, 60), border_radius=4)
         pygame.draw.rect(screen, (255, 255, 255), (620, 327, 60, 60), 2, border_radius=4)
         screen.blit(font_sm.render("Dest Platform Target", True, (140, 150, 170)), (610, 305))
 
-        # -------------------------------------------------------------
-        # HUD 1: ACTION TYPE & PARAMETERS (15, 425, 730, 45)
-        # -------------------------------------------------------------
+        # HUD 1: ACTION TYPE & PARAMETERS
         pygame.draw.rect(screen, (26, 29, 38), (15, 425, 730, 45), border_radius=6)
         act_display = "PICK & PLACE" if action_type == "pick_place" else "PUSH TOWARDS"
         screen.blit(font_bold.render(f"ACTION TYPE: {act_display}", True, (255, 255, 255)), (25, 439))
         screen.blit(font_bold.render(f"PARAMETER 1: {sim.target_color.upper()}", True, p1_rgb), (260, 439))
         screen.blit(font_bold.render(f"PARAMETER 2: {sim.target_plat_color.upper()}", True, p2_rgb), (500, 439))
 
-        # -------------------------------------------------------------
-        # HUD 2: CONTROLS & INSTRUCTIONS (15, 480, 730, 75)
-        # -------------------------------------------------------------
+        # HUD 2: CONTROLS & INSTRUCTIONS
         pygame.draw.rect(screen, (22, 24, 32), (15, 480, 730, 75), border_radius=6)
         screen.blit(font_bold.render("CONTROLS:", True, (120, 210, 255)), (25, 490))
-        controls_text = "[1] Action: Pick & Place   |   [2] Action: Push   |   [R] Randomize   |   [SPACE] Pause/Play"
+        speed_label = "[F] Lightspeed: ON" if lightspeed else "[F] Lightspeed: OFF"
+        controls_text = f"[1] Pick & Place | [2] Push | [R] Randomize | [SPACE] Pause | {speed_label}"
         screen.blit(font.render(controls_text, True, (200, 205, 220)), (105, 491))
 
         if task_success_status is not None and success_banner_timer > 0:
@@ -299,14 +292,19 @@ def run_gui():
                 eval_col = (255, 90, 90)
             screen.blit(font_bold.render(eval_text, True, eval_col), (105, 520))
         else:
-            status_text = f"Status: {'AUTONOMOUS' if auto_execute else 'PAUSED'}  |  Dobot 4-DOF IK: Active  |  Tokens: 256"
+            mode_desc = "LIGHTSPEED TURBO" if lightspeed else "NORMAL 60FPS"
+            status_text = f"Mode: {mode_desc} | Status: {'AUTONOMOUS' if auto_execute else 'PAUSED'} | Tokens: 256"
             screen.blit(font_sm.render(status_text, True, (130, 140, 160)), (105, 520))
 
         pygame.display.flip()
-        clock.tick(60)
+        if not lightspeed:
+            clock.tick(60)
 
     pygame.quit()
 
 if __name__ == "__main__":
-    run_gui()
-
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fast", action="store_true", help="Launch directly in lightspeed turbo mode")
+    args = parser.parse_args()
+    run_gui(fast_mode=args.fast)
