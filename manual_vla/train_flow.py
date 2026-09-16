@@ -421,15 +421,15 @@ def compute_episode_reward(sim, trajectory, action_type):
     total_reward = r_approach + r_grasp + r_transport + r_success
     return total_reward, task_succeeded, grasped_at_any_point, min_dist_to_cube
 
-def rl_finetune(num_episodes=150, lr=2e-5, update_every=4):
+def rl_finetune(num_episodes=500, lr=2e-5, update_every=4, target_success_rate=90.0):
     sys.path.append(os.path.join(os.path.dirname(__file__), "env"))
     from dobot_env import DobotPickPlaceSim
 
     print("=" * 68, flush=True)
-    print("   MANUAL VLA POLICY: REINFORCEMENT LEARNING FINE-TUNING", flush=True)
-    print("   - Initialized from Pretrained Flow-Matching Weights", flush=True)
-    print("   - Proprioception-Conditioned Policy: Current EE -> Action Chunk", flush=True)
-    print("   - Environment-in-the-Loop Policy Gradient Optimization", flush=True)
+    print("   MANUAL VLA POLICY: LONG-HORIZON REINFORCEMENT LEARNING", flush=True)
+    print("   - Initialized from Pretrained Cross-Attention Transformer Weights", flush=True)
+    print("   - Optimization Goal: Train continuously until high success rate", flush=True)
+    print("   - Target Window Success Rate: >= {:.1f}%".format(target_success_rate), flush=True)
     print("=" * 68, flush=True)
 
     sim = DobotPickPlaceSim()
@@ -449,7 +449,13 @@ def rl_finetune(num_episodes=150, lr=2e-5, update_every=4):
     best_success_rate = 0.0
     recent_successes = []
 
-    for ep in range(1, num_episodes + 1):
+    ep = 0
+    while True:
+        ep += 1
+        if num_episodes > 0 and ep > num_episodes:
+            print(f"\n[INFO] Reached requested episode limit ({num_episodes}). Finishing RL.", flush=True)
+            break
+
         action_type = "pick_place" if (ep % 2 == 0) else "push"
         obs = sim.reset(random_scene=True, num_distractors=2, action_type=action_type)
 
@@ -461,13 +467,15 @@ def rl_finetune(num_episodes=150, lr=2e-5, update_every=4):
         with torch.no_grad():
             clean_traj = model.sample(img_t, intent_t, proprio=proprio_t, num_steps=20).squeeze(0)
 
-        noise = torch.randn_like(clean_traj) * 0.012
+        # Subtle exploration noise (decaying as policy matures)
+        noise_std = max(0.005, 0.012 * (0.998 ** ep))
+        noise = torch.randn_like(clean_traj) * noise_std
         exp_traj_t = clean_traj + noise
         exp_traj = exp_traj_t.cpu().numpy()
 
         reward, succ, grasped, min_d = compute_episode_reward(sim, exp_traj, action_type)
-        recent_successes.append(1.0 if succ else (0.5 if grasped else 0.0))
-        if len(recent_successes) > 20:
+        recent_successes.append(1.0 if succ else 0.0)
+        if len(recent_successes) > 30:
             recent_successes.pop(0)
 
         advantage = reward - running_baseline
@@ -488,20 +496,28 @@ def rl_finetune(num_episodes=150, lr=2e-5, update_every=4):
             optimizer.zero_grad(set_to_none=True)
 
         succ_pct = sum(recent_successes) / len(recent_successes) * 100.0
-        print(f"EP {ep:03d}/{num_episodes} | Act: {action_type[:4].upper()} | MinDist: {min_d*1000:.1f}mm | Grasped: {grasped} | Succ: {succ} | R: {reward:.1f} | Adv: {advantage:+.1f} | Window Rate: {succ_pct:.1f}%", flush=True)
+        max_str = f"{num_episodes}" if num_episodes > 0 else "INF"
+        print(f"EP {ep:04d}/{max_str} | Act: {action_type[:4].upper()} | MinDist: {min_d*1000:.1f}mm | Grasped: {grasped} | Succ: {succ} | R: {reward:.1f} | Adv: {advantage:+.1f} | Win30: {succ_pct:.1f}%", flush=True)
 
-        if ep % 25 == 0 or succ_pct > best_success_rate:
+        if succ_pct > best_success_rate or ep % 20 == 0:
             best_success_rate = max(best_success_rate, succ_pct)
             torch.save(model.state_dict(), model_path)
 
+        # Convergence criteria: if reached target success rate over rolling window of 30
+        if len(recent_successes) >= 30 and succ_pct >= target_success_rate:
+            print(f"\n[GOAL REACHED] Model achieved {succ_pct:.1f}% success rate over last 30 trials! Task solved.", flush=True)
+            torch.save(model.state_dict(), model_path)
+            break
+
     torch.save(model.state_dict(), model_path)
-    print(f"\n[DONE] RL Fine-tuning complete. Model checkpoint saved -> {model_path}", flush=True)
+    print(f"\n[DONE] Long-Horizon RL complete. Model checkpoint saved -> {model_path}", flush=True)
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "train"
     if mode == "rl":
-        episodes = int(sys.argv[2]) if len(sys.argv) > 2 else 150
-        rl_finetune(num_episodes=episodes)
+        episodes = int(sys.argv[2]) if len(sys.argv) > 2 else 0 # 0 means train until success
+        target_pct = float(sys.argv[3]) if len(sys.argv) > 3 else 90.0
+        rl_finetune(num_episodes=episodes, target_success_rate=target_pct)
     else:
         epochs = int(sys.argv[1]) if len(sys.argv) > 1 else 250
         train(epochs=epochs)
