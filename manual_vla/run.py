@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import time
 import torch
@@ -59,9 +59,12 @@ def run_gui(fast_mode=False):
     task_success_status = None
     lightspeed = fast_mode
 
-    # Continuous control tracking
+    # Continuous control & session statistics tracking
     episode_total_ticks = 0
     MAX_EPISODE_TICKS = 220 # Safety watchdog to prevent endless wandering
+    total_episodes = 0
+    successful_episodes = 0
+    failed_episodes = 0
 
     # Vectorized patch heatmap computation (sub-0.2ms)
     def compute_dense_patch_heatmap_vec(img_hwc, target_rgb):
@@ -113,10 +116,18 @@ def run_gui(fast_mode=False):
                     # If physical goal is accomplished at ANY point, mark success and transition!
                     if final_cube_dist_to_plat < 0.040 and sim.target_cube_pos[2] <= 0.025 and not sim.gripper_closed:
                         task_success_status = True
+                        total_episodes += 1
+                        successful_episodes += 1
                         success_banner_timer = 20 if lightspeed else 45
+                        rate = (successful_episodes / total_episodes) * 100.0
+                        print(f"[TRIAL #{total_episodes:03d}] SUCCESS! (Total: {successful_episodes} Success, {failed_episodes} Failed | Win Rate: {rate:.1f}%)", flush=True)
                     elif episode_total_ticks >= MAX_EPISODE_TICKS:
                         task_success_status = False
+                        total_episodes += 1
+                        failed_episodes += 1
                         success_banner_timer = 20 if lightspeed else 45
+                        rate = (successful_episodes / total_episodes) * 100.0
+                        print(f"[TRIAL #{total_episodes:03d}] FAILED / TIMEOUT. (Total: {successful_episodes} Success, {failed_episodes} Failed | Win Rate: {rate:.1f}%)", flush=True)
 
                 if task_success_status is not None:
                     if success_banner_timer > 0:
@@ -303,15 +314,16 @@ def run_gui(fast_mode=False):
 
         if task_success_status is not None and success_banner_timer > 0:
             if task_success_status:
-                eval_text = "EVALUATION: SUCCESS - TARGET CUBE ON PLATFORM!"
+                eval_text = f"EVALUATION: SUCCESS - TARGET CUBE ON PLATFORM!  [Score: {successful_episodes}/{total_episodes}]"
                 eval_col = (50, 240, 100)
             else:
-                eval_text = "EVALUATION: TIMEOUT / MISPLACED"
+                eval_text = f"EVALUATION: TIMEOUT / MISPLACED  [Score: {successful_episodes}/{total_episodes}]"
                 eval_col = (255, 90, 90)
             screen.blit(font_bold.render(eval_text, True, eval_col), (105, 520))
         else:
             mode_desc = "LIGHTSPEED TURBO" if lightspeed else "NORMAL 60FPS"
-            status_text = f"Mode: {mode_desc} | Continuous Rollout: ACTIVE (Tick {episode_total_ticks}) | Tokens: 256"
+            win_pct = (successful_episodes / total_episodes * 100.0) if total_episodes > 0 else 0.0
+            status_text = f"Mode: {mode_desc} | Trial #{total_episodes + 1} | Succ: {successful_episodes} Fail: {failed_episodes} ({win_pct:.1f}%)"
             screen.blit(font_sm.render(status_text, True, (130, 140, 160)), (105, 520))
 
         pygame.display.flip()
@@ -319,6 +331,20 @@ def run_gui(fast_mode=False):
             clock.tick(60)
 
     pygame.quit()
+
+    # -------------------------------------------------------------
+    # Session Summary Report
+    # -------------------------------------------------------------
+    print("\n" + "=" * 55, flush=True)
+    print("           SESSION EVALUATION SUMMARY", flush=True)
+    print("=" * 55, flush=True)
+    print(f"  Total Trials Run     : {total_episodes}", flush=True)
+    print(f"  Successful Trials    : {successful_episodes}", flush=True)
+    print(f"  Failed / Incomplete  : {failed_episodes}", flush=True)
+    if total_episodes > 0:
+        win_rate = (successful_episodes / total_episodes) * 100.0
+        print(f"  Overall Success Rate : {win_rate:.1f}%", flush=True)
+    print("=" * 55 + "\n", flush=True)
 
 if __name__ == "__main__":
     import argparse
