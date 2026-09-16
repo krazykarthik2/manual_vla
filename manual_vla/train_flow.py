@@ -404,26 +404,37 @@ def compute_episode_reward(sim, trajectory, action_type):
         d_plat = np.linalg.norm(sim.target_cube_pos[:2] - plat_pos[:2])
         min_dist_to_plat = min(min_dist_to_plat, d_plat)
 
-    # Assess final physical placement: is the right cube on top of the right platform?
-    # Platform radius is 0.035m, cube on platform has z <= 0.025m, and gripper released
+    # Assess final physical placement: is the right cube on top of / at the right platform?
+    # Platform radius is 0.035m.
     final_cube_dist_to_plat = np.linalg.norm(sim.target_cube_pos[:2] - plat_pos[:2])
-    task_succeeded = bool(
-        final_cube_dist_to_plat < 0.040 and
-        sim.target_cube_pos[2] <= 0.025 and
-        not sim.gripper_closed
-    )
+    if action_type == "pick_place":
+        # Must be on top of platform (z <= 0.025) and gripper released
+        task_succeeded = bool(
+            final_cube_dist_to_plat < 0.040 and
+            sim.target_cube_pos[2] <= 0.025 and
+            not sim.gripper_closed
+        )
+    else:
+        # Push action: cube pushed to / onto platform
+        task_succeeded = bool(
+            final_cube_dist_to_plat < 0.045 and
+            not sim.gripper_closed
+        )
 
     # Dense reward shaping:
-    # 1. Approach bonus: max +10 if within grasp reach
+    # 1. Approach bonus: max +10 if within reach of cube
     r_approach = max(0.0, (0.20 - min_dist_to_cube) / 0.20) * 10.0
-    # 2. Grasp bonus: +25 if target cube successfully held
-    r_grasp = 25.0 if grasped_at_any_point else 0.0
-    # 3. Transport bonus: max +20 if brought to destination platform
+    # 2. Manipulation bonus: +25 if target cube grasped (pick) or contacted (push)
+    if action_type == "pick_place":
+        r_manip = 25.0 if grasped_at_any_point else 0.0
+    else:
+        r_manip = 25.0 if min_dist_to_cube < 0.025 else 0.0
+    # 3. Transport/Push bonus: max +20 if brought to destination platform
     r_transport = max(0.0, (0.25 - final_cube_dist_to_plat) / 0.25) * 20.0
-    # 4. Success bonus: +50 when right thing is on top of right platform
+    # 4. Success bonus: +50 when right thing is on/at right platform
     r_success = 50.0 if task_succeeded else 0.0
 
-    total_reward = r_approach + r_grasp + r_transport + r_success
+    total_reward = r_approach + r_manip + r_transport + r_success
     return total_reward, task_succeeded, grasped_at_any_point, min_dist_to_cube
 
 def rl_finetune(num_episodes=500, lr=2e-5, update_every=4, target_success_rate=90.0):
