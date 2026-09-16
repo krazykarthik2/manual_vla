@@ -22,6 +22,31 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "demos")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
+def safe_save_model(state_dict, path):
+    tmp_path = path + ".tmp"
+    for attempt in range(5):
+        try:
+            torch.save(state_dict, tmp_path)
+            if os.path.exists(path):
+                try:
+                    os.replace(tmp_path, path)
+                except OSError:
+                    import time
+                    time.sleep(0.05)
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                    os.rename(tmp_path, path)
+            else:
+                os.rename(tmp_path, path)
+            return
+        except Exception as e:
+            if attempt == 4:
+                print(f"[WARN] Failed to save checkpoint: {e}", flush=True)
+            import time
+            time.sleep(0.1)
+
 # -----------------------------------------------------------------------------
 # Parameterized Embeddings (Without heavy LLM overhead: intent, source, dest)
 # -----------------------------------------------------------------------------
@@ -361,7 +386,7 @@ def train(epochs=120, batch_size=16, lr=1.8e-3):
 
             if avg_loss < best_loss or epoch % 20 == 0:
                 best_loss = min(best_loss, avg_loss)
-                torch.save(model.state_dict(), model_path)
+                safe_save_model(model.state_dict(), model_path)
 
             current_lr = scheduler.get_last_lr()[0]
             epoch_pbar.set_postfix({
@@ -372,10 +397,10 @@ def train(epochs=120, batch_size=16, lr=1.8e-3):
 
     except KeyboardInterrupt:
         print("\n[INFO] Training interrupted. Saving checkpoint...", flush=True)
-        torch.save(model.state_dict(), model_path)
+        safe_save_model(model.state_dict(), model_path)
         return
 
-    torch.save(model.state_dict(), model_path)
+    safe_save_model(model.state_dict(), model_path)
     print(f"\n[SUCCESS] Manual VLA checkpoint saved -> {model_path}", flush=True)
 
 # -----------------------------------------------------------------------------
@@ -550,15 +575,15 @@ def rl_finetune(num_episodes=500, lr=2e-5, update_every=4, target_success_rate=9
 
         if succ_pct > best_success_rate or ep % 20 == 0:
             best_success_rate = max(best_success_rate, succ_pct)
-            torch.save(model.state_dict(), model_path)
+            safe_save_model(model.state_dict(), model_path)
 
         # Convergence criteria: if reached target success rate over rolling window of 30
         if len(recent_successes) >= 30 and succ_pct >= target_success_rate:
             print(f"\n[GOAL REACHED] Model achieved {succ_pct:.1f}% success rate over last 30 trials! Task solved.", flush=True)
-            torch.save(model.state_dict(), model_path)
+            safe_save_model(model.state_dict(), model_path)
             break
 
-    torch.save(model.state_dict(), model_path)
+    safe_save_model(model.state_dict(), model_path)
     print(f"\n[DONE] Long-Horizon RL complete. Model checkpoint saved -> {model_path}", flush=True)
 
 if __name__ == "__main__":
