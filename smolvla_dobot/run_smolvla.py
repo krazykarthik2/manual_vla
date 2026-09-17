@@ -16,15 +16,20 @@ def run_smolvla(fast_mode=False):
 
     tokenizer = SmolVLMTokenizer()
     model = SmolVLAPolicy(vocab_size=len(tokenizer.vocab), d_model=128, num_layers=2)
-    has_model = False
-    if os.path.exists(model_path):
-        try:
-            model.load_state_dict(torch.load(model_path, map_location=device))
-            model.eval()
-            has_model = True
-            print("[INFO] SmolVLA Model loaded successfully!", flush=True)
-        except Exception as e:
-            print(f"[WARN] Error loading model: {e}", flush=True)
+    if not os.path.exists(model_path):
+        print("\n" + "=" * 65, flush=True)
+        print(f"[ERROR] No trained checkpoint found at: {model_path}", flush=True)
+        print("        Please run fasttrain_smolvla.bat to train the policy first!", flush=True)
+        print("=" * 65 + "\n", flush=True)
+        sys.exit(1)
+
+    try:
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.eval()
+        print(f"[INFO] SmolVLA Model loaded successfully from {model_path}!", flush=True)
+    except Exception as e:
+        print(f"[ERROR] Failed loading model checkpoint: {e}", flush=True)
+        sys.exit(1)
 
     sim = DobotPickPlaceSim()
     pygame.init()
@@ -122,21 +127,13 @@ def run_smolvla(fast_mode=False):
                     need_replan = (current_trajectory is None) or (traj_step >= len(current_trajectory))
 
                     if need_replan:
-                        if has_model:
-                            with torch.no_grad():
-                                img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)
-                                token_ids = tokenizer.encode(sim.instruction, max_len=16).unsqueeze(0)
-                                proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0)
-                                sample_steps = 10 if lightspeed else 20
-                                current_trajectory = model.sample(img_t, token_ids, proprio=proprio_t, num_steps=sample_steps).squeeze(0).numpy()
-                                traj_step = 0
-                        else:
-                            c_pos = sim.target_cube_pos
-                            p_pos = sim.target_platform_pos
-                            target_xyz = c_pos if not sim.grasped else p_pos
-                            grip = 1.0 if np.linalg.norm(sim.ee_pos[:3] - c_pos) < 0.035 else 0.0
-                            delta = np.clip(target_xyz - sim.ee_pos[:3], -0.008, 0.008)
-                            obs, _ = sim.step_delta(np.array([delta[0], delta[1], delta[2], 0.0, grip], dtype=np.float32))
+                        with torch.no_grad():
+                            img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)
+                            token_ids = tokenizer.encode(sim.instruction, max_len=16).unsqueeze(0)
+                            proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0)
+                            sample_steps = 10 if lightspeed else 20
+                            current_trajectory = model.sample(img_t, token_ids, proprio=proprio_t, num_steps=sample_steps).squeeze(0).numpy()
+                            traj_step = 0
 
                     if current_trajectory is not None and traj_step < len(current_trajectory):
                         target_point = current_trajectory[traj_step]
