@@ -75,7 +75,7 @@ def train_smolvla_with_demo_anchored_rl(
             data_iter = iter(dataloader)
             d_img, d_tokens, d_proprio, d_norm_traj = next(data_iter)
 
-        action_type = "pick_place" if (ep % 2 == 1) else "push"
+        action_type = "pick_place"
         obs = sim.reset(random_scene=True, num_distractors=2, action_type=action_type)
 
         img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)

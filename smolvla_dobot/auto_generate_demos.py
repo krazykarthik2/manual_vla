@@ -156,7 +156,7 @@ def run_auto_demonstrator(num_demos=60, base_delay=0.00005):
 
     while demos_completed < num_demos:
         demo_idx = get_next_demo_index()
-        act_choice = "pick_place" if (demos_completed % 2 == 0) else "push"
+        act_choice = "pick_place" # Pure Pick and Place demonstrations only
         obs_dict = sim.reset(random_scene=True, num_distractors=2, action_type=act_choice)
         
         target_start = sim.target_cube_pos.copy()
