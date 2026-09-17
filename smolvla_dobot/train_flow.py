@@ -10,13 +10,14 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-# Multi-core CPU Configuration
-DEVICE = torch.device("cpu")
-NUM_CORES = os.cpu_count() or 4
-torch.set_num_threads(NUM_CORES)
-torch.set_num_interop_threads(NUM_CORES)
-os.environ["OMP_NUM_THREADS"] = str(NUM_CORES)
-os.environ["MKL_NUM_THREADS"] = str(NUM_CORES)
+# Device Configuration (Auto CUDA / Multi-core CPU)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if DEVICE.type == "cpu":
+    NUM_CORES = os.cpu_count() or 4
+    torch.set_num_threads(NUM_CORES)
+    torch.set_num_interop_threads(NUM_CORES)
+    os.environ["OMP_NUM_THREADS"] = str(NUM_CORES)
+    os.environ["MKL_NUM_THREADS"] = str(NUM_CORES)
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "demos")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")

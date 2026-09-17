@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import glob
 import math
@@ -13,11 +13,12 @@ from tqdm import tqdm
 from smolvla_embedding import SmolVLMTokenizer
 from smolvla_model import SmolVLABackbone
 
-# Multi-core CPU Configuration
-DEVICE = torch.device("cpu")
-NUM_CORES = os.cpu_count() or 4
-torch.set_num_threads(NUM_CORES)
-torch.set_num_interop_threads(NUM_CORES)
+# Device Configuration (Auto CUDA / Multi-core CPU)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if DEVICE.type == "cpu":
+    NUM_CORES = os.cpu_count() or 4
+    torch.set_num_threads(NUM_CORES)
+    torch.set_num_interop_threads(NUM_CORES)
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "demonstrations")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
@@ -205,13 +206,13 @@ def train(epochs=200, batch_size=16, lr=1.8e-3):
     print("   SmolVLA Multimodal Flow-Matching Policy Training", flush=True)
     print("   - ViT Patch Encoder (256 Patches) & Subword Tokenizer", flush=True)
     print("   - Full Multi-Head Self & Cross-Attention Fusion Layers", flush=True)
-    print("   - Optimal Transport Velocity Regression | 100% CPU", flush=True)
+    print(f"   - Hardware Compute Engine: {DEVICE} ({'CUDA GPU Acceleration' if DEVICE.type == 'cuda' else 'Optimized Multi-core CPU'})", flush=True)
     print("=" * 68, flush=True)
 
     dataset = SmolVLADataset(DATA_DIR)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    model = SmolVLAPolicy(vocab_size=len(dataset.tokenizer.vocab), d_model=128, num_layers=2)
+    model = SmolVLAPolicy(vocab_size=len(dataset.tokenizer.vocab), d_model=128, num_layers=2).to(DEVICE)
     model.train()
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -228,11 +229,16 @@ def train(epochs=200, batch_size=16, lr=1.8e-3):
         for epoch in epoch_pbar:
             total_loss = 0.0
             for img, token_ids, proprio, x_1 in dataloader:
+                img = img.to(DEVICE)
+                token_ids = token_ids.to(DEVICE)
+                proprio = proprio.to(DEVICE)
+                x_1 = x_1.to(DEVICE)
+
                 B = img.size(0)
                 optimizer.zero_grad(set_to_none=True)
 
                 x_0 = torch.randn_like(x_1)
-                t = torch.rand(B)
+                t = torch.rand(B, device=DEVICE)
                 t_expanded = t.view(B, 1, 1)
 
                 x_t = (1.0 - t_expanded) * x_0 + t_expanded * x_1
@@ -241,7 +247,7 @@ def train(epochs=200, batch_size=16, lr=1.8e-3):
                 v_pred = model.forward_flow(x_t, t, img, token_ids, proprio=proprio)
 
                 loss_raw = loss_fn(v_pred, u_t)
-                dim_weights = torch.tensor([1.2, 1.2, 1.5, 2.5]).view(1, 1, 4)
+                dim_weights = torch.tensor([1.2, 1.2, 1.5, 2.5], device=DEVICE).view(1, 1, 4)
                 weighted_loss = (loss_raw * dim_weights).mean()
 
                 weighted_loss.backward()

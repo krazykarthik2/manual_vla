@@ -8,14 +8,14 @@ import pygame
 sys.path.append(os.path.join(os.path.dirname(__file__), "env"))
 from dobot_env import DobotPickPlaceSim, COLOR_PALETTE
 from smolvla_embedding import SmolVLMTokenizer
-from train_smolvla import SmolVLAPolicy, MODEL_DIR
+from train_smolvla import SmolVLAPolicy, MODEL_DIR, DEVICE
 
 def run_smolvla(fast_mode=False):
-    device = torch.device("cpu")
+    device = DEVICE
     model_path = os.path.join(MODEL_DIR, "dobot_bc_policy.pth")
 
     tokenizer = SmolVLMTokenizer()
-    model = SmolVLAPolicy(vocab_size=len(tokenizer.vocab), d_model=128, num_layers=2)
+    model = SmolVLAPolicy(vocab_size=len(tokenizer.vocab), d_model=128, num_layers=2).to(device)
     if not os.path.exists(model_path):
         print("\n" + "=" * 65, flush=True)
         print(f"[ERROR] No trained checkpoint found at: {model_path}", flush=True)
@@ -128,11 +128,11 @@ def run_smolvla(fast_mode=False):
 
                     if need_replan:
                         with torch.no_grad():
-                            img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)
-                            token_ids = tokenizer.encode(sim.instruction, max_len=16).unsqueeze(0)
-                            proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0)
+                            img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0).to(device)
+                            token_ids = tokenizer.encode(sim.instruction, max_len=16).unsqueeze(0).to(device)
+                            proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0).to(device)
                             sample_steps = 10 if lightspeed else 20
-                            current_trajectory = model.sample(img_t, token_ids, proprio=proprio_t, num_steps=sample_steps).squeeze(0).numpy()
+                            current_trajectory = model.sample(img_t, token_ids, proprio=proprio_t, num_steps=sample_steps).squeeze(0).cpu().numpy()
                             traj_step = 0
 
                     if current_trajectory is not None and traj_step < len(current_trajectory):

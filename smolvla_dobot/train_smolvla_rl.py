@@ -11,7 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "env"))
 from dobot_env import DobotPickPlaceSim
-from train_smolvla import SmolVLAPolicy, SmolVLADataset, safe_save_model, ACTION_MEAN, ACTION_STD, MODEL_DIR, DATA_DIR
+from train_smolvla import SmolVLAPolicy, SmolVLADataset, safe_save_model, ACTION_MEAN, ACTION_STD, MODEL_DIR, DATA_DIR, DEVICE
 
 def train_smolvla_with_demo_anchored_rl(
     num_episodes=150,
@@ -26,18 +26,19 @@ def train_smolvla_with_demo_anchored_rl(
     print("   - Frozen / Pre-trained Multimodal Vision-Language Backbone", flush=True)
     print("   - Trainable Cross-Attention Action Head + 70/30 Demo Replay Anchor", flush=True)
     print("   - Terminal Physical Verification & Continuous Receding Horizon", flush=True)
+    print(f"   - Hardware Compute Engine: {DEVICE} ({'CUDA GPU Acceleration' if DEVICE.type == 'cuda' else 'Optimized Multi-core CPU'})", flush=True)
     print("=" * 68, flush=True)
 
     dataset = SmolVLADataset(DATA_DIR)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    model = SmolVLAPolicy(vocab_size=len(dataset.tokenizer.vocab), d_model=128, num_layers=2)
+    model = SmolVLAPolicy(vocab_size=len(dataset.tokenizer.vocab), d_model=128, num_layers=2).to(DEVICE)
     model_path = os.path.join(MODEL_DIR, "dobot_bc_policy.pth")
 
     # Load existing checkpoint if available
     if os.path.exists(model_path):
         try:
-            model.load_state_dict(torch.load(model_path, map_location="cpu"))
+            model.load_state_dict(torch.load(model_path, map_location=DEVICE))
             print(f">> Loaded existing SmolVLA checkpoint -> {model_path}", flush=True)
         except Exception as e:
             print(f"[WARN] Checkpoint load failed: {e}", flush=True)
@@ -78,13 +79,13 @@ def train_smolvla_with_demo_anchored_rl(
         action_type = "pick_place"
         obs = sim.reset(random_scene=True, num_distractors=2, action_type=action_type)
 
-        img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)
-        token_ids = dataset.tokenizer.encode(sim.instruction, max_len=16).unsqueeze(0)
-        proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0)
+        img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        token_ids = dataset.tokenizer.encode(sim.instruction, max_len=16).unsqueeze(0).to(DEVICE)
+        proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
         # 1. Sample trajectory from model
         with torch.no_grad():
-            trajectory = model.sample(img_t, token_ids, proprio=proprio_t, num_steps=20).squeeze(0).numpy()
+            trajectory = model.sample(img_t, token_ids, proprio=proprio_t, num_steps=20).squeeze(0).cpu().numpy()
 
         # 2. Execute trajectory rollouts
         min_d = float("inf")
@@ -128,9 +129,9 @@ def train_smolvla_with_demo_anchored_rl(
 
         # 5. RL Flow-Matching loss
         B = 1
-        x_1_env = torch.tensor(trajectory, dtype=torch.float32).unsqueeze(0)
+        x_1_env = torch.tensor(trajectory, dtype=torch.float32, device=DEVICE).unsqueeze(0)
         x_0_env = torch.randn_like(x_1_env)
-        t_env = torch.rand(B)
+        t_env = torch.rand(B, device=DEVICE)
         t_exp = t_env.view(B, 1, 1)
 
         x_t_env = (1.0 - t_exp) * x_0_env + t_exp * x_1_env
@@ -141,9 +142,14 @@ def train_smolvla_with_demo_anchored_rl(
         rl_loss = base_rl_loss * max(-2.0, min(2.0, -advantage * 0.05))
 
         # 6. Demo Anchor Loss (70% anchor to expert kinematic demonstrations)
+        d_img = d_img.to(DEVICE)
+        d_tokens = d_tokens.to(DEVICE)
+        d_proprio = d_proprio.to(DEVICE)
+        d_norm_traj = d_norm_traj.to(DEVICE)
+
         B_d = d_img.size(0)
         x_0_demo = torch.randn_like(d_norm_traj)
-        t_demo = torch.rand(B_d)
+        t_demo = torch.rand(B_d, device=DEVICE)
         t_d_exp = t_demo.view(B_d, 1, 1)
 
         x_t_demo = (1.0 - t_d_exp) * x_0_demo + t_d_exp * d_norm_traj
