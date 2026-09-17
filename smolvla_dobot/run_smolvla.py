@@ -8,7 +8,7 @@ import pygame
 sys.path.append(os.path.join(os.path.dirname(__file__), "env"))
 from dobot_env import DobotPickPlaceSim, COLOR_PALETTE
 from smolvla_embedding import SmolVLMTokenizer
-from smolvla_train import SmolVLAPolicy, MODEL_DIR
+from train_smolvla import SmolVLAPolicy, MODEL_DIR
 
 def run_smolvla(fast_mode=False):
     device = torch.device("cpu")
