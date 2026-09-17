@@ -137,7 +137,7 @@ def train_smolvla_with_demo_anchored_rl(
         x_t_env = (1.0 - t_exp) * x_0_env + t_exp * x_1_env
         u_t_env = x_1_env - x_0_env
 
-        v_pred_env = model.forward_flow(x_t_env, t_env, img_t, token_ids, proprio=proprio_t)
+        v_pred_env, _ = model.forward_flow(x_t_env, t_env, img_t, token_ids, proprio=proprio_t)
         base_rl_loss = loss_fn(v_pred_env, u_t_env)
         rl_loss = base_rl_loss * max(-2.0, min(2.0, -advantage * 0.05))
 
@@ -155,7 +155,7 @@ def train_smolvla_with_demo_anchored_rl(
         x_t_demo = (1.0 - t_d_exp) * x_0_demo + t_d_exp * d_norm_traj
         u_t_demo = d_norm_traj - x_0_demo
 
-        v_pred_demo = model.forward_flow(x_t_demo, t_demo, d_img, d_tokens, proprio=d_proprio)
+        v_pred_demo, _ = model.forward_flow(x_t_demo, t_demo, d_img, d_tokens, proprio=d_proprio)
         demo_loss = loss_fn(v_pred_demo, u_t_demo)
 
         # Combined 70/30 anchor loss

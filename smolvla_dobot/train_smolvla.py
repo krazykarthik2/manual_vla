@@ -49,9 +49,9 @@ def safe_save_model(state_dict, path):
             import time
             time.sleep(0.1)
 
-# Normalization constants for 4D actions (X, Y, Z, Gripper)
-ACTION_MEAN = torch.tensor([0.2066, 0.0024, 0.0738, 0.2617], dtype=torch.float32)
-ACTION_STD  = torch.tensor([0.0326, 0.0816, 0.0405, 0.4396], dtype=torch.float32)
+# Empirical normalization constants for 4D actions (X, Y, Z, Gripper) matching 100% pick-and-place dataset
+ACTION_MEAN = torch.tensor([0.2028, 0.0008, 0.0854, 0.5360], dtype=torch.float32)
+ACTION_STD  = torch.tensor([0.0330, 0.0837, 0.0362, 0.4987], dtype=torch.float32)
 
 class ContinuousSinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim):
@@ -95,18 +95,24 @@ class SmolVLAPolicy(nn.Module):
             nn.Linear(d_model, d_model)
         )
 
-        # 3. Action Decoder Queries & Cross-Attention Head
+        # 3. Action Decoder Queries & 2-Layer Transformer Cross-Attention Head
         self.action_in_proj = nn.Linear(action_dim, d_model)
         self.pos_queries = nn.Parameter(torch.randn(1, horizon, d_model) * 0.02)
+        self.grounded_proj = nn.Linear(2, d_model)
 
-        self.action_cross_attn = nn.MultiheadAttention(d_model, 4, batch_first=True)
-        self.norm_act1 = nn.LayerNorm(d_model)
-        self.norm_act2 = nn.LayerNorm(d_model)
-        self.act_ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, d_model)
-        )
+        self.dec_sa1 = nn.MultiheadAttention(d_model, 4, batch_first=True)
+        self.dec_ca1 = nn.MultiheadAttention(d_model, 4, batch_first=True)
+        self.dec_n1 = nn.LayerNorm(d_model)
+        self.dec_n2 = nn.LayerNorm(d_model)
+        self.dec_n3 = nn.LayerNorm(d_model)
+        self.dec_ffn1 = nn.Sequential(nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, d_model))
+
+        self.dec_sa2 = nn.MultiheadAttention(d_model, 4, batch_first=True)
+        self.dec_ca2 = nn.MultiheadAttention(d_model, 4, batch_first=True)
+        self.dec_n4 = nn.LayerNorm(d_model)
+        self.dec_n5 = nn.LayerNorm(d_model)
+        self.dec_n6 = nn.LayerNorm(d_model)
+        self.dec_ffn2 = nn.Sequential(nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, d_model))
 
         # Output Flow Vector Field
         self.out_head = nn.Sequential(
@@ -119,28 +125,39 @@ class SmolVLAPolicy(nn.Module):
     def forward_flow(self, x_t, t, img, token_ids, proprio=None):
         B = img.size(0)
 
-        # 1. Multimodal feature extraction through ViT + Self/Cross Attention
-        text_feats, vis_feats, _ = self.backbone(token_ids, img) # text: [B, 16, d], vis: [B, 256, d]
+        # 1. Multimodal feature extraction through CoordConv + Cross Attention
+        text_feats, vis_feats, _, grounded_2d = self.backbone(token_ids, img) # text: [B, 16, d], vis: [B, 256, d]
 
-        # 2. Proprioception & Time conditioning
+        # 2. Proprioception, Time, and Grounded Spatial Target conditioning
         if proprio is None:
             proprio = torch.zeros(B, 5, device=img.device)
         p_token = self.proprio_proj(proprio).unsqueeze(1) # [B, 1, d]
         t_token = self.time_embed(t).unsqueeze(1)         # [B, 1, d]
+        g_token = self.grounded_proj(grounded_2d).unsqueeze(1) # [B, 1, d]
 
-        # Joint Multimodal Context: 16 (text) + 256 (vit) + 1 (proprio) + 1 (time) = 274 tokens
-        context = torch.cat([p_token, t_token, text_feats, vis_feats], dim=1) # [B, 274, d]
+        # Joint Multimodal Context: 1 (grounded target) + 1 (proprio) + 1 (time) + 16 (text) + 256 (vis) = 275 tokens
+        context = torch.cat([g_token, p_token, t_token, text_feats, vis_feats], dim=1) # [B, 275, d]
 
-        # 3. Action Decoder Stream
+        # 3. Action Decoder Stream (2-layer transformer decoder)
         act_queries = self.action_in_proj(x_t) + self.pos_queries # [B, horizon, d]
-        act_norm = self.norm_act1(act_queries)
-        attn_out, _ = self.action_cross_attn(act_norm, context, context)
-        act_queries = act_queries + attn_out
-        act_queries = act_queries + self.act_ffn(self.norm_act2(act_queries))
+
+        # Decoder Layer 1
+        sa_out, _ = self.dec_sa1(act_queries, act_queries, act_queries)
+        act_queries = self.dec_n1(act_queries + sa_out)
+        ca_out, _ = self.dec_ca1(act_queries, context, context)
+        act_queries = self.dec_n2(act_queries + ca_out)
+        act_queries = self.dec_n3(act_queries + self.dec_ffn1(act_queries))
+
+        # Decoder Layer 2
+        sa_out2, _ = self.dec_sa2(act_queries, act_queries, act_queries)
+        act_queries = self.dec_n4(act_queries + sa_out2)
+        ca_out2, _ = self.dec_ca2(act_queries, context, context)
+        act_queries = self.dec_n5(act_queries + ca_out2)
+        act_queries = self.dec_n6(act_queries + self.dec_ffn2(act_queries))
 
         # 4. Predict velocity field
         v_pred = self.out_head(act_queries) # [B, horizon, 4]
-        return v_pred
+        return v_pred, grounded_2d
 
     @torch.no_grad()
     def sample(self, img, token_ids, proprio=None, num_steps=20):
@@ -150,8 +167,8 @@ class SmolVLAPolicy(nn.Module):
 
         for i in range(num_steps):
             t = torch.full((B,), (i + 0.5) * dt, device=img.device)
-            v = self.forward_flow(x, t, img, token_ids, proprio=proprio)
-            x = x - v * dt
+            v, _ = self.forward_flow(x, t, img, token_ids, proprio=proprio)
+            x = x + v * dt
 
         raw_x = x * ACTION_STD.to(img.device) + ACTION_MEAN.to(img.device)
         kernel = torch.ones(1, 1, 5, device=img.device) / 5.0
@@ -186,7 +203,17 @@ class SmolVLADataset(Dataset):
             raw_traj = np.concatenate([proprio[:, :3], acts[:, 4:5]], axis=-1) # [128, 4]
             norm_traj = (torch.tensor(raw_traj, dtype=torch.float32) - ACTION_MEAN) / (ACTION_STD + 1e-6)
             proprio0 = proprio[0] # [5]
-            self.samples.append((img0, token_ids, proprio0, norm_traj))
+
+            # Ground truth 2D target cube coordinate in normalized image space [-1, 1]
+            if 'observations' in d and len(d['observations']) > 0:
+                cx_phys, cy_phys = d['observations'][0][5:7]
+                px = 32.0 + (cy_phys / 0.28) * 28.0
+                py = 58.0 - ((cx_phys - 0.10) / 0.25) * 52.0
+                target_2d = np.array([(px - 31.5) / 31.5, (py - 31.5) / 31.5], dtype=np.float32)
+            else:
+                target_2d = np.zeros(2, dtype=np.float32)
+
+            self.samples.append((img0, token_ids, proprio0, norm_traj, target_2d))
 
         print(f">> Successfully indexed {len(self.samples)} trajectory demonstrations with subword language tokens.", flush=True)
 
@@ -194,8 +221,8 @@ class SmolVLADataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img, token_ids, proprio0, norm_traj = self.samples[idx]
-        return torch.tensor(img, dtype=torch.float32), token_ids, torch.tensor(proprio0, dtype=torch.float32), norm_traj
+        img, token_ids, proprio0, norm_traj, target_2d = self.samples[idx]
+        return torch.tensor(img, dtype=torch.float32), token_ids, torch.tensor(proprio0, dtype=torch.float32), norm_traj, torch.tensor(target_2d, dtype=torch.float32)
 
 
 # -----------------------------------------------------------------------------
@@ -203,9 +230,9 @@ class SmolVLADataset(Dataset):
 # -----------------------------------------------------------------------------
 def train(epochs=200, batch_size=16, lr=1.8e-3):
     print("=" * 68, flush=True)
-    print("   SmolVLA Multimodal Flow-Matching Policy Training", flush=True)
-    print("   - ViT Patch Encoder (256 Patches) & Subword Tokenizer", flush=True)
-    print("   - Full Multi-Head Self & Cross-Attention Fusion Layers", flush=True)
+    print("   SmolVLA Spatially Grounded Multimodal Flow-Matching Policy", flush=True)
+    print("   - CoordConv Spatial Feature Pyramid + Soft-Argmax Target Grounding", flush=True)
+    print("   - 2-Layer Transformer Action Decoder with Dual Cross-Attention", flush=True)
     print(f"   - Hardware Compute Engine: {DEVICE} ({'CUDA GPU Acceleration' if DEVICE.type == 'cuda' else 'Optimized Multi-core CPU'})", flush=True)
     print("=" * 68, flush=True)
 
@@ -228,11 +255,12 @@ def train(epochs=200, batch_size=16, lr=1.8e-3):
     try:
         for epoch in epoch_pbar:
             total_loss = 0.0
-            for img, token_ids, proprio, x_1 in dataloader:
+            for img, token_ids, proprio, x_1, target_2d in dataloader:
                 img = img.to(DEVICE)
                 token_ids = token_ids.to(DEVICE)
                 proprio = proprio.to(DEVICE)
                 x_1 = x_1.to(DEVICE)
+                target_2d = target_2d.to(DEVICE)
 
                 B = img.size(0)
                 optimizer.zero_grad(set_to_none=True)
@@ -244,15 +272,20 @@ def train(epochs=200, batch_size=16, lr=1.8e-3):
                 x_t = (1.0 - t_expanded) * x_0 + t_expanded * x_1
                 u_t = x_1 - x_0
 
-                v_pred = model.forward_flow(x_t, t, img, token_ids, proprio=proprio)
+                v_pred, pred_grounded_2d = model.forward_flow(x_t, t, img, token_ids, proprio=proprio)
 
+                # 1. Flow-matching velocity vector loss
                 loss_raw = loss_fn(v_pred, u_t)
                 dim_weights = torch.tensor([1.2, 1.2, 1.5, 2.5], device=DEVICE).view(1, 1, 4)
-                weighted_loss = (loss_raw * dim_weights).mean()
+                flow_loss = (loss_raw * dim_weights).mean()
 
-                weighted_loss.backward()
+                # 2. Auxiliary Spatial Grounding Loss: ensures cross-attention accurately pinpoints target cube in 2D
+                grounding_loss = F.mse_loss(pred_grounded_2d, target_2d)
+
+                total_batch_loss = flow_loss + 0.50 * grounding_loss
+                total_batch_loss.backward()
                 optimizer.step()
-                total_loss += weighted_loss.item() * B
+                total_loss += total_batch_loss.item() * B
 
             scheduler.step()
             avg_loss = total_loss / len(dataset)

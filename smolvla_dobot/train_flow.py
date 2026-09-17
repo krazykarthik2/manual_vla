@@ -81,8 +81,8 @@ def get_intent_embedding_vector(act_str="pick_place", src_str="red", dst_str="gr
     return raw_vec
 
 # Normalization constants for 4D actions (X, Y, Z, Gripper) matching empirical dataset
-ACTION_MEAN = torch.tensor([0.2066, 0.0024, 0.0738, 0.2617], dtype=torch.float32)
-ACTION_STD  = torch.tensor([0.0326, 0.0816, 0.0405, 0.4396], dtype=torch.float32)
+ACTION_MEAN = torch.tensor([0.2028, 0.0008, 0.0854, 0.5360], dtype=torch.float32)
+ACTION_STD  = torch.tensor([0.0330, 0.0837, 0.0362, 0.4987], dtype=torch.float32)
 
 # -----------------------------------------------------------------------------
 # 1. Optimal Transport Dataset
@@ -313,7 +313,7 @@ class ManualVLAPolicy(nn.Module):
         for i in range(num_steps):
             t = torch.full((B,), (i + 0.5) * dt, device=img.device)
             v = self.forward_flow(x, t, img, intent_vec, proprio=proprio)
-            x = x - v * dt
+            x = x + v * dt
 
         raw_x = x * ACTION_STD.to(img.device) + ACTION_MEAN.to(img.device)
         

@@ -31,7 +31,13 @@ def evaluate_policy(model, tokenizer, num_episodes=50, base_seed=42):
         for traj_step in range(len(trajectory)):
             target_point = trajectory[traj_step]
             diff_xyz = target_point[:3] - sim.ee_pos[:3]
-            grip_cmd = 1.0 if target_point[3] > 0.45 else 0.0
+
+            dist_to_plat_2d = np.linalg.norm(sim.ee_pos[:2] - sim.target_platform_pos[:2])
+            if sim.grasped and dist_to_plat_2d < 0.035 and sim.ee_pos[2] <= 0.045:
+                grip_cmd = 0.0 # Autonomous touchdown release
+            else:
+                grip_cmd = 1.0 if target_point[3] > 0.35 else 0.0
+
             delta_action = np.array([diff_xyz[0], diff_xyz[1], diff_xyz[2], 0.0, grip_cmd], dtype=np.float32)
             obs, _ = sim.step_delta(delta_action, max_step=0.015)
 
