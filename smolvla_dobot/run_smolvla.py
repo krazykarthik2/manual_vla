@@ -78,12 +78,6 @@ def run_smolvla(fast_mode=False):
                     current_trajectory = None
                     task_success_status = None
                     episode_total_ticks = 0
-                elif event.key == pygame.K_2:
-                    action_type = "push"
-                    sim.action_type = action_type
-                    current_trajectory = None
-                    task_success_status = None
-                    episode_total_ticks = 0
                 elif event.key == pygame.K_r:
                     obs = sim.reset(random_scene=True, num_distractors=2, action_type=action_type)
                     current_trajectory = None
