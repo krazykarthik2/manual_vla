@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import time
 import math
@@ -196,19 +196,22 @@ def run_auto_demonstrator(num_demos=60, base_delay=0.00005):
                 push_dir /= dist
             else:
                 push_dir = np.array([1.0, 0.0])
-            behind_pos = target_start[:2] - push_dir * 0.040
-            push_dest = target_start[:2] + push_dir * 0.085
+
+            # Behind position (aligned with push vector)
+            behind_pos = target_start[:2] - push_dir * 0.038
+            # Push destination targets directly onto the platform center
+            push_dest = platform_target[:2] + push_dir * 0.010
 
             p_behind_high = np.array([behind_pos[0], behind_pos[1], 0.080], dtype=np.float32)
-            p_behind_low = np.array([behind_pos[0], behind_pos[1], 0.020], dtype=np.float32)
-            p_push_end = np.array([push_dest[0], push_dest[1], 0.020], dtype=np.float32)
+            p_behind_low = np.array([behind_pos[0], behind_pos[1], 0.015], dtype=np.float32)
+            p_push_end = np.array([push_dest[0], push_dest[1], 0.015], dtype=np.float32)
             p_retract = np.array([push_dest[0], push_dest[1], 0.100], dtype=np.float32)
             p_home = np.array([0.20, 0.0, 0.12], dtype=np.float32)
 
             stages = [
                 (f"1. Move Behind {sim.target_color.upper()} Cube", p_start, p_behind_high, 0.0, 0.0, calc_velocity_steps(p_start, p_behind_high, 0.009, 14)),
                 (f"2. Lower Behind {sim.target_color.upper()} Cube", p_behind_high, p_behind_low, 0.0, 0.0, calc_velocity_steps(p_behind_high, p_behind_low, 0.007, 10)),
-                (f"3. Push Toward {sim.target_plat_color.upper()}", p_behind_low, p_push_end, 0.0, 0.0, calc_velocity_steps(p_behind_low, p_push_end, 0.006, 20)),
+                (f"3. Push Toward {sim.target_plat_color.upper()}", p_behind_low, p_push_end, 0.0, 0.0, calc_velocity_steps(p_behind_low, p_push_end, 0.005, 25)),
                 (f"4. Retract Gripper", p_push_end, p_retract, 0.0, 1.0, calc_velocity_steps(p_push_end, p_retract, 0.008, 10)),
                 (f"5. Return Home", p_retract, p_home, 0.0, 1.0, calc_velocity_steps(p_retract, p_home, 0.009, 14)),
             ]
@@ -261,6 +264,13 @@ def run_auto_demonstrator(num_demos=60, base_delay=0.00005):
             print("\n[INFO] Demonstration generation stopped by user.")
             break
 
+        # Strict Demo Quality Verification Filter: Only save demos that ACTUALLY succeed!
+        final_dist_to_plat = np.linalg.norm(sim.target_cube_pos[:2] - sim.target_platform_pos[:2])
+        is_demo_valid = (final_dist_to_plat < 0.040 and sim.target_cube_pos[2] <= 0.025)
+        if not is_demo_valid:
+            print(f"[REJECTED] Demo #{demo_idx:03d} failed to place/push object onto platform (dist: {final_dist_to_plat*1000:.1f}mm). Discarding...", flush=True)
+            continue
+
         img_arr = np.array(img_list, dtype=np.float32)
         proprio_arr = np.array(proprio_list, dtype=np.float32)
         legacy_arr = np.array(legacy_obs_list, dtype=np.float32)
@@ -285,7 +295,7 @@ def run_auto_demonstrator(num_demos=60, base_delay=0.00005):
         )
         demos_completed += 1
         total_now = count_saved_demos()
-        print(f"[SUCCESS] Saved Demo #{demo_idx:03d} [{act_choice.upper()}] ({sim.target_color}->{sim.target_plat_color} | Total: {total_now} | Steps: {orig_len}) -> {os.path.basename(filename)}")
+        print(f"[SUCCESS] Saved Verified Demo #{demo_idx:03d} [{act_choice.upper()}] ({sim.target_color}->{sim.target_plat_color} | Total: {total_now} | Dist: {final_dist_to_plat*1000:.1f}mm)")
 
     pygame.quit()
     print(f"\n[DONE] Finished batch! Total {count_saved_demos()} demonstration datasets in: {DATA_DIR}")
