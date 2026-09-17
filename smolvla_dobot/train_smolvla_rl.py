@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import glob
 import math
@@ -65,7 +65,9 @@ def train_smolvla_with_demo_anchored_rl(
 
     data_iter = iter(dataloader)
 
-    for ep in range(1, num_episodes + 1):
+    ep = 0
+    while True:
+        ep += 1
         # Sample next demo anchor batch (cycling)
         try:
             d_img, d_tokens, d_proprio, d_norm_traj = next(data_iter)
@@ -160,7 +162,8 @@ def train_smolvla_with_demo_anchored_rl(
             optimizer.zero_grad(set_to_none=True)
 
         succ_pct = (sum(recent_successes) / len(recent_successes)) * 100.0
-        print(f"EP {ep:03d}/{num_episodes} | Act: {action_type[:4].upper()} | MinDist: {min_d*1000:.1f}mm | Grasped: {grasped} | Succ: {succ} | R: {reward:+.1f} | Win30: {succ_pct:.1f}%", flush=True)
+        max_str = f"{num_episodes}" if num_episodes > 0 else "INF"
+        print(f"EP {ep:04d}/{max_str} | Act: {action_type[:4].upper()} | MinDist: {min_d*1000:.1f}mm | Grasped: {grasped} | Succ: {succ} | R: {reward:+.1f} | Win30: {succ_pct:.1f}%", flush=True)
 
         if succ_pct > best_success_rate or ep % 20 == 0:
             best_success_rate = max(best_success_rate, succ_pct)
@@ -171,9 +174,14 @@ def train_smolvla_with_demo_anchored_rl(
             safe_save_model(model.state_dict(), model_path)
             break
 
+        if num_episodes > 0 and ep >= num_episodes:
+            print(f"\n[INFO] Reached requested episode limit ({num_episodes}). Finishing RL.", flush=True)
+            break
+
     safe_save_model(model.state_dict(), model_path)
     print(f"\n[DONE] SmolVLA Demo-Anchored RL complete! Checkpoint saved -> {model_path}", flush=True)
 
 if __name__ == "__main__":
     episodes = int(sys.argv[1]) if len(sys.argv) > 1 else 150
-    train_smolvla_with_demo_anchored_rl(num_episodes=episodes)
+    target_pct = float(sys.argv[2]) if len(sys.argv) > 2 else 90.0
+    train_smolvla_with_demo_anchored_rl(num_episodes=episodes, target_success_rate=target_pct)
