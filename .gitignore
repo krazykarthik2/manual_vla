@@ -1,7 +1,28 @@
 *.npz
 *.pt
+*.pth
 *.tmp
+*.onnx
+
+# Generated data & caches
 **/data/**
 data/
 smolvla_dobot/data/
 manual_vla/data/
+
+# Model checkpoints
+**/models/
+smolvla_dobot/models/
+manual_vla/models/
+
+# Generated demos
+**/generations/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+Thumbs.db
+.DS_Store
