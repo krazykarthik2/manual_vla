@@ -215,8 +215,8 @@ class FastSmolVLADataset(Dataset):
                 with torch.no_grad():
                     p, _ = vlm.encode_vision(img)
                     t = vlm.encode_text(toks)
-                cached_patches.append(p[0].cpu())
-                cached_txt.append(t[0].cpu())
+                cached_patches.append(p[0].float().cpu())
+                cached_txt.append(t[0].float().cpu())
 
             os.makedirs(os.path.dirname(cache_file), exist_ok=True)
             torch.save({
