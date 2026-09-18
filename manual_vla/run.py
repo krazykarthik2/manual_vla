@@ -171,17 +171,8 @@ def run_gui(fast_mode=False):
                         else:
                             traj_step += 2 if lightspeed else 1
                         
-                        # Closed-loop physical grip execution:
-                        # Model predicts target_point[3] in normalized scale; also check actual grasp distance
-                        dist_to_cube = np.linalg.norm(sim.ee_pos[:3] - sim.target_cube_pos)
-                        d_plat = np.linalg.norm(sim.target_cube_pos[:2] - sim.target_platform_pos[:2])
-                        
-                        if sim.grasped and d_plat < 0.038 and sim.ee_pos[2] < 0.035:
-                            grip_cmd = 0.0 # Release at platform
-                        elif (dist_to_cube < 0.035 and sim.ee_pos[2] < 0.040) or sim.grasped:
-                            grip_cmd = 1.0 # Secure grasp
-                        else:
-                            grip_cmd = 1.0 if target_point[3] > 0.35 else 0.0
+                        # Pure model-predicted gripper: 4th action dim is the grip signal
+                        grip_cmd = 1.0 if target_point[3] > 0.5 else 0.0
                             
                         max_step_rate = 0.015 if lightspeed else 0.010
                         delta_action = np.array([diff_xyz[0], diff_xyz[1], diff_xyz[2], 0.0, grip_cmd], dtype=np.float32)
