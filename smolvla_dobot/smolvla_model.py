@@ -38,6 +38,7 @@ class PretrainedVLMEncoder(nn.Module):
         x = (img_224 - img_mean) / img_std
         
         vis = self.clip.visual
+        x = x.to(vis.conv1.weight.dtype)  # CLIP loads as float16 on CUDA
         x = vis.conv1(x) # [B, 768, 7, 7]
         x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1) # [B, 49, 768]
         cls_token = vis.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
