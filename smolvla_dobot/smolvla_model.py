@@ -136,7 +136,7 @@ class SmolVLABackbone(nn.Module):
             
             # Zero-shot pretrained similarity heatmap
             base_weights = torch.einsum('bld,bpd->blp', text_feats, vis_patches) # [B, 77, 49]
-            base_probs = F.softmax(base_weights * 5.0, dim=-1)
+            base_probs = F.softmax(base_weights * 50.0, dim=-1)
 
         # Project 512 -> 128
         cur_txt = self.txt_proj(text_feats[:, :16]) # [B, 16, 128]
