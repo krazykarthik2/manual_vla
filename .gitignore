@@ -1,3 +1,7 @@
 *.npz
-vlm_features_cache.pt
+*.pt
 *.tmp
+**/data/**
+data/
+smolvla_dobot/data/
+manual_vla/data/
