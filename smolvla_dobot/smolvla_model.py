@@ -59,6 +59,7 @@ class PretrainedVLMEncoder(nn.Module):
         # text_tokens: [B, 77]
         t_x = self.clip.token_embedding(text_tokens)
         t_x = t_x + self.clip.positional_embedding
+        t_x = t_x.to(self.clip.dtype)  # match CLIP weights (float16 on CUDA)
         t_x = t_x.permute(1, 0, 2)
         t_x = self.clip.transformer(t_x)
         t_x = t_x.permute(1, 0, 2)
