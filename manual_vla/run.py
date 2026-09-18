@@ -7,7 +7,7 @@ import pygame
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "env"))
 from dobot_env import DobotPickPlaceSim, COLOR_PALETTE
-from train_flow import ManualVLAPolicy, get_intent_embedding_vector, MODEL_DIR
+from train_flow import ManualVLAPolicy, get_color_ids, MODEL_DIR
 
 def run_gui(fast_mode=False):
     device = torch.device("cpu")
@@ -58,6 +58,7 @@ def run_gui(fast_mode=False):
     success_banner_timer = 0
     task_success_status = None
     lightspeed = fast_mode
+    last_vlm_attn = None
 
     # Continuous control & session statistics tracking
     episode_total_ticks = 0
@@ -65,17 +66,6 @@ def run_gui(fast_mode=False):
     total_episodes = 0
     successful_episodes = 0
     failed_episodes = 0
-
-    # Vectorized patch heatmap computation (sub-0.2ms)
-    def compute_dense_patch_heatmap_vec(img_hwc, target_rgb):
-        patch_means = img_hwc.reshape(16, 4, 16, 4, 3).mean(axis=(1, 3)) / 255.0
-        tgt = np.array(target_rgb, dtype=np.float32) / 255.0
-        dists = np.linalg.norm(patch_means - tgt, axis=2)
-        grid = np.exp(-dists * 5.0)
-        g_min, g_max = grid.min(), grid.max()
-        if g_max > g_min:
-            grid = (grid - g_min) / (g_max - g_min + 1e-6)
-        return grid
 
     while running:
         for event in pygame.event.get():
@@ -150,12 +140,15 @@ def run_gui(fast_mode=False):
                         if has_model:
                             with torch.no_grad():
                                 img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)
-                                intent_raw = get_intent_embedding_vector(action_type, sim.target_color, sim.target_plat_color)
-                                intent_t = torch.tensor(intent_raw, dtype=torch.float32).unsqueeze(0)
+                                color_ids_raw = get_color_ids(sim.target_color, sim.target_plat_color)
+                                color_ids_t = torch.tensor(color_ids_raw, dtype=torch.long).unsqueeze(0)
                                 proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0)
                                 sample_steps = 10 if lightspeed else 20
-                                current_trajectory = model.sample(img_t, intent_t, proprio=proprio_t, num_steps=sample_steps).squeeze(0).numpy()
+                                traj_out, attn_out = model.sample(img_t, color_ids_t, proprio=proprio_t, num_steps=sample_steps, return_attn=True)
+                                current_trajectory = traj_out.squeeze(0).numpy()
                                 traj_step = 0
+                                if attn_out is not None:
+                                    last_vlm_attn = attn_out[0].cpu().numpy() # [2, 256]
                         else:
                             c_pos = sim.target_cube_pos
                             p_pos = sim.target_platform_pos
@@ -178,7 +171,18 @@ def run_gui(fast_mode=False):
                         else:
                             traj_step += 2 if lightspeed else 1
                         
-                        grip_cmd = 1.0 if target_point[3] > 0.45 else 0.0
+                        # Closed-loop physical grip execution:
+                        # Model predicts target_point[3] in normalized scale; also check actual grasp distance
+                        dist_to_cube = np.linalg.norm(sim.ee_pos[:3] - sim.target_cube_pos)
+                        d_plat = np.linalg.norm(sim.target_cube_pos[:2] - sim.target_platform_pos[:2])
+                        
+                        if sim.grasped and d_plat < 0.038 and sim.ee_pos[2] < 0.035:
+                            grip_cmd = 0.0 # Release at platform
+                        elif (dist_to_cube < 0.035 and sim.ee_pos[2] < 0.040) or sim.grasped:
+                            grip_cmd = 1.0 # Secure grasp
+                        else:
+                            grip_cmd = 1.0 if target_point[3] > 0.35 else 0.0
+                            
                         max_step_rate = 0.015 if lightspeed else 0.010
                         delta_action = np.array([diff_xyz[0], diff_xyz[1], diff_xyz[2], 0.0, grip_cmd], dtype=np.float32)
                         obs, _ = sim.step_delta(delta_action, max_step=max_step_rate)
@@ -246,18 +250,34 @@ def run_gui(fast_mode=False):
             pygame.draw.circle(screen, (255, 170, 50), pt, 4)
         pygame.draw.circle(screen, grip_color, pts_side[-1], 7)
 
-        # Panels 3 & 4: HIGH-RESOLUTION 256 EMBEDDING PATCHES
+        # Panels 3 & 4: HIGH-RESOLUTION 256 EMBEDDING PATCHES (VLM Cross-Attention)
         img_hwc = (np.transpose(obs["image"], (1, 2, 0)) * 255).astype(np.uint8)
 
         p1_rgb = COLOR_PALETTE.get(sim.target_color, (240, 45, 45))
         p2_rgb = COLOR_PALETTE.get(sim.target_plat_color, (40, 210, 80))
-        heatmap_p1 = compute_dense_patch_heatmap_vec(img_hwc, p1_rgb)
-        heatmap_p2 = compute_dense_patch_heatmap_vec(img_hwc, p2_rgb)
+        if last_vlm_attn is None and has_model:
+            with torch.no_grad():
+                img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)
+                color_ids_raw = get_color_ids(sim.target_color, sim.target_plat_color)
+                color_ids_t = torch.tensor(color_ids_raw, dtype=torch.long).unsqueeze(0)
+                proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0)
+                _, last_attn_t = model.forward_flow(torch.zeros(1, 128, 4), torch.zeros(1), img_t, color_ids_t, proprio=proprio_t)
+                last_vlm_attn = last_attn_t[0].cpu().numpy()
 
-        # Panel 3: PARAM 1
+        if last_vlm_attn is not None:
+            # Live cross-attention weights directly from model
+            a1 = last_vlm_attn[0].reshape(16, 16)
+            a2 = last_vlm_attn[1].reshape(16, 16)
+            heatmap_p1 = (a1 - a1.min()) / (a1.max() - a1.min() + 1e-6)
+            heatmap_p2 = (a2 - a2.min()) / (a2.max() - a2.min() + 1e-6)
+        else:
+            heatmap_p1 = np.zeros((16, 16), dtype=np.float32)
+            heatmap_p2 = np.zeros((16, 16), dtype=np.float32)
+
+        # Panel 3: PARAM 1 (Target Cube)
         pygame.draw.rect(screen, (28, 31, 40), (15, 275, 355, 135), border_radius=6)
-        screen.blit(font_bold.render(f"PARAM 1 EMBEDDING ({sim.target_color.upper()})", True, (255, 200, 100)), (25, 282))
-        screen.blit(font_sm.render("256 Visual Tokens (16x16 Fine Patch Grid):", True, (150, 160, 180)), (25, 298))
+        screen.blit(font_bold.render(f"VLM ATTN: TARGET CUBE <{sim.target_color.upper()}>", True, (255, 200, 100)), (25, 282))
+        screen.blit(font_sm.render("Token <cube> -> 256 Patch Cross-Attention:", True, (150, 160, 180)), (25, 298))
 
         g1_x, g1_y = 25, 317
         b_size = 5
@@ -277,10 +297,10 @@ def run_gui(fast_mode=False):
         pygame.draw.rect(screen, (100, 220, 255), (245, 317, 80, 80), 1)
         screen.blit(font_sm.render("Raw Overhead Camera", True, (140, 150, 170)), (235, 300))
 
-        # Panel 4: PARAM 2
+        # Panel 4: PARAM 2 (Target Platform)
         pygame.draw.rect(screen, (28, 31, 40), (390, 275, 355, 135), border_radius=6)
-        screen.blit(font_bold.render(f"PARAM 2 EMBEDDING ({sim.target_plat_color.upper()})", True, (100, 220, 255)), (400, 282))
-        screen.blit(font_sm.render("256 Visual Tokens (16x16 Fine Patch Grid):", True, (150, 160, 180)), (400, 298))
+        screen.blit(font_bold.render(f"VLM ATTN: DEST PLATFORM <{sim.target_plat_color.upper()}>", True, (100, 220, 255)), (400, 282))
+        screen.blit(font_sm.render("Token <plat> -> 256 Patch Cross-Attention:", True, (150, 160, 180)), (400, 298))
 
         g2_x, g2_y = 400, 317
         for r in range(16):

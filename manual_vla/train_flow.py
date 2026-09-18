@@ -48,43 +48,26 @@ def safe_save_model(state_dict, path):
             time.sleep(0.1)
 
 # -----------------------------------------------------------------------------
-# Parameterized Embeddings (Without heavy LLM overhead: intent, source, dest)
+# Color Vocabulary for VLM Cross-Attention
 # -----------------------------------------------------------------------------
-COLOR_MAP = {
+COLOR_VOCAB = {
     "red": 0, "blue": 1, "yellow": 2, "green": 3,
     "purple": 4, "orange": 5, "cyan": 6
 }
 ACTION_MAP = {"pick_place": 0, "push": 1}
 
-def get_intent_embedding_vector(act_str="pick_place", src_str="red", dst_str="green", dim=128):
-    """
-    Constructs a 128-dim structured continuous parameter embedding:
-    - Action type (Pick & Place vs Push)
-    - Source object color/target
-    - Destination platform color/target
-    """
-    act_idx = ACTION_MAP.get(act_str, 0)
-    src_idx = COLOR_MAP.get(src_str, 0)
-    dst_idx = COLOR_MAP.get(dst_str, 3)
-
-    act_onehot = np.zeros(4, dtype=np.float32)
-    act_onehot[act_idx] = 1.0
-
-    src_onehot = np.zeros(8, dtype=np.float32)
-    src_onehot[src_idx] = 1.0
-
-    dst_onehot = np.zeros(8, dtype=np.float32)
-    dst_onehot[dst_idx] = 1.0
-
-    raw_vec = np.concatenate([act_onehot, src_onehot, dst_onehot]) # 20 dims
-    return raw_vec
+def get_color_ids(tgt_cube="red", tgt_plat="green"):
+    """Returns a [2] tensor containing the token IDs for the target cube and destination platform."""
+    c_id = COLOR_VOCAB.get(tgt_cube, 0)
+    p_id = COLOR_VOCAB.get(tgt_plat, 3)
+    return np.array([c_id, p_id], dtype=np.int64)
 
 # Normalization constants for 4D actions (X, Y, Z, Gripper) matching empirical dataset
 ACTION_MEAN = torch.tensor([0.2066, 0.0024, 0.0738, 0.2617], dtype=torch.float32)
 ACTION_STD  = torch.tensor([0.0326, 0.0816, 0.0405, 0.4396], dtype=torch.float32)
 
 # -----------------------------------------------------------------------------
-# 1. Optimal Transport Dataset
+# 1. Optimal Transport Dataset with VLM Grounding Targets
 # -----------------------------------------------------------------------------
 class OTFlowMatchingDataset(Dataset):
     def __init__(self, data_dir):
@@ -93,7 +76,7 @@ class OTFlowMatchingDataset(Dataset):
             raise ValueError(f"No demonstration files found in {data_dir}. Run auto_generate_demos.py first!")
 
         self.samples = []
-        print(f">> Indexing {len(files)} demonstrations for Flow-Matching...", flush=True)
+        print(f">> Indexing {len(files)} demonstrations for Flow-Matching with VLM Cross-Attention...", flush=True)
 
         for f in files:
             d = np.load(f, allow_pickle=True)
@@ -101,16 +84,30 @@ class OTFlowMatchingDataset(Dataset):
             proprio = d['proprioception'].astype(np.float32) # [128, 5]
             acts = d['actions'].astype(np.float32) # [128, 6]
             
-            act_type = str(d['action_type'][0]) if 'action_type' in d else "pick_place"
             tgt_color = str(d['target_color'][0]) if 'target_color' in d else "red"
             tgt_plat = str(d['target_plat_color'][0]) if 'target_plat_color' in d else "green"
 
-            intent_vec = get_intent_embedding_vector(act_type, tgt_color, tgt_plat)
+            color_ids = get_color_ids(tgt_color, tgt_plat)
 
             raw_traj = np.concatenate([proprio[:, :3], acts[:, 4:5]], axis=-1) # [128, 4]
             norm_traj = (torch.tensor(raw_traj, dtype=torch.float32) - ACTION_MEAN) / (ACTION_STD + 1e-6)
             proprio0 = proprio[0] # [5] (x, y, z, yaw, gripper)
-            self.samples.append((img0, intent_vec, proprio0, norm_traj))
+
+            # Ground truth 2D target patch indices for VLM cross-attention supervision
+            if 'observations' in d and len(d['observations']) > 0:
+                cx_phys, cy_phys = d['observations'][0][5:7]
+                px_phys, py_phys = d['observations'][0][8:10]
+                cpx = int(np.clip(32 + (cy_phys / 0.28) * 28, 0, 63))
+                cpy = int(np.clip(58 - ((cx_phys - 0.10) / 0.25) * 52, 0, 63))
+                ppx = int(np.clip(32 + (py_phys / 0.28) * 28, 0, 63))
+                ppy = int(np.clip(58 - ((px_phys - 0.10) / 0.25) * 52, 0, 63))
+                c_patch_idx = (cpy // 4) * 16 + (cpx // 4)
+                p_patch_idx = (ppy // 4) * 16 + (ppx // 4)
+                target_patches = np.array([c_patch_idx, p_patch_idx], dtype=np.int64)
+            else:
+                target_patches = np.array([0, 0], dtype=np.int64)
+
+            self.samples.append((img0, color_ids, proprio0, norm_traj, target_patches))
 
         print(f">> Successfully indexed {len(self.samples)} trajectory demonstrations.", flush=True)
 
@@ -118,8 +115,8 @@ class OTFlowMatchingDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img, intent_vec, proprio0, norm_traj = self.samples[idx]
-        return torch.tensor(img, dtype=torch.float32), torch.tensor(intent_vec, dtype=torch.float32), torch.tensor(proprio0, dtype=torch.float32), norm_traj
+        img, color_ids, proprio0, norm_traj, target_patches = self.samples[idx]
+        return torch.tensor(img, dtype=torch.float32), torch.tensor(color_ids, dtype=torch.long), torch.tensor(proprio0, dtype=torch.float32), norm_traj, torch.tensor(target_patches, dtype=torch.long)
 
 # -----------------------------------------------------------------------------
 # 2. Vision Patch & Flow Matching Policy Architecture
@@ -209,14 +206,15 @@ class CrossAttentionBlock(nn.Module):
 
 class ManualVLAPolicy(nn.Module):
     """
-    True Vision-Language-Action Cross-Attention Transformer Policy (ACT-style):
+    True Vision-Language-Action Cross-Attention Transformer Policy (ACT / VLM-style):
     - 256 Visual Patch Tokens (16x16 grid from 4x4 patches on 64x64 top camera)
     - 2D Sinusoidal Positional Embeddings
-    - Goal & Intent Tokenizer (Action type, Target Cube color, Destination platform)
+    - Token <color> Embeddings (Target Cube color token + Destination Platform color token)
+    - VLM Cross-Attention: Token <color> queries Image Patches per frame -> extracts grounded visual spatial features
     - Proprioception State Tokenizer (live x, y, z, yaw, gripper)
     - Cross-Attention Transformer Decoder with Flow Matching Action Head
     """
-    def __init__(self, raw_intent_dim=20, horizon=128, action_dim=4, d_model=128, num_layers=4):
+    def __init__(self, vocab_size=len(COLOR_VOCAB), horizon=128, action_dim=4, d_model=128, num_layers=4):
         super().__init__()
         self.horizon = horizon
         self.action_dim = action_dim
@@ -226,19 +224,24 @@ class ManualVLAPolicy(nn.Module):
         self.patch_embed = nn.Conv2d(3, d_model, kernel_size=4, stride=4) # [B, d_model, 16, 16]
         self.pos_embed = Sinusoidal2DPositionalEmbedding(d_model, grid_size=16)
         
-        # 2. Intent and Proprioception Tokenizers
-        self.intent_proj = nn.Sequential(
-            nn.Linear(raw_intent_dim, d_model),
+        # 2. Token <color> Embedding & VLM Cross-Attention Module
+        self.color_embed = nn.Embedding(vocab_size, d_model)
+        self.norm_color = nn.LayerNorm(d_model)
+        self.norm_vis = nn.LayerNorm(d_model)
+        self.vlm_cross_attn = nn.MultiheadAttention(d_model, 4, batch_first=True)
+        self.vlm_proj = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model)
         )
+
+        # 3. Proprioception & Continuous Time Embedding
         self.proprio_proj = nn.Sequential(
             nn.Linear(5, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model)
         )
-        
-        # 3. Continuous Time Embedding
         self.time_embed = nn.Sequential(
             SinusoidalTimeEmbedding(64),
             nn.Linear(64, d_model),
@@ -246,7 +249,7 @@ class ManualVLAPolicy(nn.Module):
             nn.Linear(d_model, d_model)
         )
         
-        # 4. Action Query Tokens & Cross-Attention Transformer
+        # 4. Action Query Tokens & Cross-Attention Transformer Decoder
         self.action_in_proj = nn.Linear(action_dim, d_model)
         self.pos_queries = nn.Parameter(torch.randn(1, horizon, d_model) * 0.02)
         
@@ -264,55 +267,65 @@ class ManualVLAPolicy(nn.Module):
         )
 
     def extract_visual_tokens(self, img):
-        B = img.size(0)
         patches = self.patch_embed(img) # [B, d_model, 16, 16]
         tokens = patches.flatten(2).permute(0, 2, 1) # [B, 256, d_model]
         tokens = self.pos_embed(tokens)
         return tokens
 
-    def forward_flow(self, x_t, t, img, intent_vec, proprio=None):
+    def forward_flow(self, x_t, t, img, color_ids, proprio=None):
         B = img.size(0)
         
-        # 1. Visual tokens (256 tokens)
+        # 1. Visual tokens (256 patch tokens from camera image)
         vis_tokens = self.extract_visual_tokens(img) # [B, 256, d_model]
+
+        # 2. Token <color> queries: [B, 2, d_model] (target cube, target platform)
+        if color_ids.dim() == 1:
+            color_ids = color_ids.unsqueeze(0)
+        c_tokens = self.color_embed(color_ids) # [B, 2, d_model]
+
+        # 3. VLM Cross-Attention: Token <color> queries image patches for each frame!
+        q = self.norm_color(c_tokens)
+        kv = self.norm_vis(vis_tokens)
+        grounded_tokens, attn_weights = self.vlm_cross_attn(q, kv, kv, need_weights=True)
+        # attn_weights: [B, 2, 256] -> attention map of each token over the 256 image patches
+        grounded_tokens = self.vlm_proj(grounded_tokens + c_tokens) # [B, 2, d_model]
         
-        # 2. Context tokens (Intent + Proprioception + Time)
-        i_token = self.intent_proj(intent_vec).unsqueeze(1) # [B, 1, d_model]
-        
+        # 4. Context tokens (Proprioception + Time)
         if proprio is None:
             proprio = torch.zeros(B, 5, device=img.device)
         elif proprio.dim() == 1:
             proprio = proprio.unsqueeze(0)
         p_token = self.proprio_proj(proprio).unsqueeze(1) # [B, 1, d_model]
+        t_token = self.time_embed(t).unsqueeze(1)         # [B, 1, d_model]
         
-        t_token = self.time_embed(t).unsqueeze(1) # [B, 1, d_model]
+        # Joint Memory Sequence: 2 (grounded color tokens) + 1 (proprio) + 1 (time) + 256 (vis) = 260 tokens
+        memory = torch.cat([grounded_tokens, p_token, t_token, vis_tokens], dim=1) # [B, 260, d_model]
         
-        # Full Memory Sequence for Cross-Attention: 256 + 3 = 259 tokens
-        memory = torch.cat([i_token, p_token, t_token, vis_tokens], dim=1) # [B, 259, d_model]
-        
-        # 3. Action Sequence Queries
+        # 5. Action Sequence Queries
         act_tokens = self.action_in_proj(x_t) + self.pos_queries # [B, horizon, d_model]
         
-        # 4. Cross-Attention Transformer Layers
+        # 6. Cross-Attention Transformer Layers
         x = act_tokens
         for layer in self.layers:
-            x, attn_weights = layer(x, memory)
+            x, _ = layer(x, memory)
             
-        # 5. Predict vector field for each timestep in horizon
+        # 7. Predict vector field for each timestep in horizon
         v_pred = self.out_head(x) # [B, horizon, action_dim]
-        return v_pred
+        return v_pred, attn_weights
 
     @torch.no_grad()
-    def sample(self, img, intent_vec, proprio=None, num_steps=20):
+    def sample(self, img, color_ids, proprio=None, num_steps=20, return_attn=False):
         """Continuous Euler ODE integration from noise to predicted robot trajectory."""
         B = img.size(0)
         x = torch.randn(B, self.horizon, self.action_dim, device=img.device)
         dt = 1.0 / num_steps
+        last_attn = None
 
         for i in range(num_steps):
             t = torch.full((B,), (i + 0.5) * dt, device=img.device)
-            v = self.forward_flow(x, t, img, intent_vec, proprio=proprio)
+            v, attn = self.forward_flow(x, t, img, color_ids, proprio=proprio)
             x = x - v * dt
+            last_attn = attn
 
         raw_x = x * ACTION_STD.to(img.device) + ACTION_MEAN.to(img.device)
         
@@ -321,21 +334,17 @@ class ManualVLAPolicy(nn.Module):
         raw_perm = raw_x.permute(0, 2, 1).reshape(B * self.action_dim, 1, self.horizon)
         smoothed = F.conv1d(raw_perm, kernel, padding=2)
         smoothed = smoothed.view(B, self.action_dim, self.horizon).permute(0, 2, 1)
+        if return_attn:
+            return smoothed, last_attn
         return smoothed
-
-        return smoothed
-
-# Aliases
-TrueSmolVLAPolicy = ManualVLAPolicy
 
 # -----------------------------------------------------------------------------
-# 3. Flow Matching Training
+# 3. Flow Matching Training with VLM Cross-Attention
 # -----------------------------------------------------------------------------
 def train(epochs=120, batch_size=16, lr=1.8e-3):
     print("=" * 68, flush=True)
-    print("   Manual VLA Flow-Matching Policy Training (Cross-Attention Transformer)", flush=True)
-    print("   - Action Conditioning: Pick & Place vs Push", flush=True)
-    print("   - Patch Visual Extractor & Parameterized Embeddings", flush=True)
+    print("   Manual VLA Flow-Matching Policy Training (VLM Cross-Attention)", flush=True)
+    print("   - Token <color> Cross-Attention over 256 Visual Patches", flush=True)
     print("   - Optimal Transport Vector Field Regression | 100% CPU", flush=True)
     print("=" * 68, flush=True)
 
@@ -360,7 +369,7 @@ def train(epochs=120, batch_size=16, lr=1.8e-3):
             model.train()
             total_loss = 0.0
 
-            for img_b, intent_b, proprio_b, traj_x0 in dataloader:
+            for img_b, color_ids_b, proprio_b, traj_x0, target_patches_b in dataloader:
                 B = img_b.size(0)
                 optimizer.zero_grad(set_to_none=True)
 
@@ -372,10 +381,20 @@ def train(epochs=120, batch_size=16, lr=1.8e-3):
                 x_t = (1.0 - t_expand) * traj_x0 + t_expand * x_1
                 target_v = x_1 - traj_x0
 
-                pred_v = model.forward_flow(x_t, t, img_b, intent_vec=intent_b, proprio=proprio_b)
+                pred_v, attn_weights = model.forward_flow(x_t, t, img_b, color_ids=color_ids_b, proprio=proprio_b)
                 # Huber loss with gripper boosting
                 raw_loss = loss_fn(pred_v, target_v) # [B, horizon, 4]
-                weighted_loss = (raw_loss * dim_weights).mean()
+                flow_loss = (raw_loss * dim_weights).mean()
+
+                # VLM Attention Supervision: Token <cube_color> & <plat_color> cross-attention onto target patches
+                # attn_weights: [B, 2, 256], target_patches_b: [B, 2]
+                attn_logits = torch.log(attn_weights.clamp(min=1e-8)) # [B, 2, 256]
+                attn_loss = (
+                    F.nll_loss(attn_logits[:, 0], target_patches_b[:, 0]) +
+                    F.nll_loss(attn_logits[:, 1], target_patches_b[:, 1])
+                ) * 0.5
+
+                weighted_loss = flow_loss + 0.10 * attn_loss
                 
                 weighted_loss.backward()
                 optimizer.step()
@@ -507,12 +526,12 @@ def rl_finetune(num_episodes=500, lr=2e-5, update_every=4, target_success_rate=9
         obs = sim.reset(random_scene=True, num_distractors=2, action_type=action_type)
 
         img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0).to(DEVICE)
-        intent_raw = get_intent_embedding_vector(action_type, sim.target_color, sim.target_plat_color)
-        intent_t = torch.tensor(intent_raw, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        color_ids_raw = get_color_ids(sim.target_color, sim.target_plat_color)
+        color_ids_t = torch.tensor(color_ids_raw, dtype=torch.long).unsqueeze(0).to(DEVICE)
         proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
         with torch.no_grad():
-            clean_traj = model.sample(img_t, intent_t, proprio=proprio_t, num_steps=20).squeeze(0)
+            clean_traj = model.sample(img_t, color_ids_t, proprio=proprio_t, num_steps=20).squeeze(0)
 
         # Subtle exploration noise (decaying as policy matures)
         noise_std = max(0.004, 0.010 * (0.998 ** ep))
@@ -535,7 +554,7 @@ def rl_finetune(num_episodes=500, lr=2e-5, update_every=4, target_success_rate=9
         x_noise = torch.randn_like(x_target)
         x_interp = (1.0 - t_rand.view(1, 1, 1)) * x_target + t_rand.view(1, 1, 1) * x_noise
         v_target = x_noise - x_target
-        v_pred = model.forward_flow(x_interp, t_rand, img_t, intent_t, proprio=proprio_t)
+        v_pred, _ = model.forward_flow(x_interp, t_rand, img_t, color_ids_t, proprio=proprio_t)
 
         flow_l2 = loss_fn(v_pred, v_target)
         # Reinforce positive advantage trajectories; penalize bad moves
@@ -546,10 +565,10 @@ def rl_finetune(num_episodes=500, lr=2e-5, update_every=4, target_success_rate=9
         # 2. Demonstration Replay Anchor (Behavioral Regularization):
         # Keeps policy grounded in clean human/expert demos so RL doesn't collapse or drift
         try:
-            d_img, d_intent, d_proprio, d_traj = next(demo_iter)
+            d_img, d_color_ids, d_proprio, d_traj, d_target_patches = next(demo_iter)
         except StopIteration:
             demo_iter = iter(demo_loader)
-            d_img, d_intent, d_proprio, d_traj = next(demo_iter)
+            d_img, d_color_ids, d_proprio, d_traj, d_target_patches = next(demo_iter)
 
         d_B = d_img.size(0)
         d_noise = torch.randn_like(d_traj)
@@ -557,7 +576,7 @@ def rl_finetune(num_episodes=500, lr=2e-5, update_every=4, target_success_rate=9
         d_t_exp = d_t.view(d_B, 1, 1)
         d_interp = (1.0 - d_t_exp) * d_traj + d_t_exp * d_noise
         d_v_target = d_noise - d_traj
-        d_v_pred = model.forward_flow(d_interp, d_t, d_img, intent_vec=d_intent, proprio=d_proprio)
+        d_v_pred, _ = model.forward_flow(d_interp, d_t, d_img, color_ids=d_color_ids, proprio=d_proprio)
         demo_loss = loss_fn(d_v_pred, d_v_target)
 
         # Combined Loss: 70% Grounded in Demonstrations + 30% RL Performance Optimization

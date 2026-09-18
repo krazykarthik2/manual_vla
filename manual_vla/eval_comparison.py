@@ -1,11 +1,11 @@
-﻿import os
+import os
 import sys
 import torch
 import numpy as np
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "env"))
 from dobot_env import DobotPickPlaceSim
-from train_flow import ManualVLAPolicy, get_intent_embedding_vector, MODEL_DIR
+from train_flow import ManualVLAPolicy, get_color_ids, MODEL_DIR
 
 def evaluate_policy(model, num_episodes=50, base_seed=42):
     sim = DobotPickPlaceSim()
@@ -20,10 +20,10 @@ def evaluate_policy(model, num_episodes=50, base_seed=42):
 
         with torch.no_grad():
             img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)
-            intent_raw = get_intent_embedding_vector(action_type, sim.target_color, sim.target_plat_color)
-            intent_t = torch.tensor(intent_raw, dtype=torch.float32).unsqueeze(0)
+            color_ids_raw = get_color_ids(sim.target_color, sim.target_plat_color)
+            color_ids_t = torch.tensor(color_ids_raw, dtype=torch.long).unsqueeze(0)
             proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0)
-            trajectory = model.sample(img_t, intent_t, proprio=proprio_t, num_steps=20).squeeze(0).numpy()
+            trajectory = model.sample(img_t, color_ids_t, proprio=proprio_t, num_steps=20).squeeze(0).numpy()
 
         ep_min_dist = float("inf")
         grasped_in_ep = False
