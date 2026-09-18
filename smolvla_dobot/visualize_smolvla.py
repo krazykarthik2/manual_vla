@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import torch
 import numpy as np
@@ -38,6 +38,21 @@ def visualize_all_smolvla_inputs():
         sy = int(240 - (z / 0.22) * 130)
         return sx, sy
 
+    # Optionally load trained checkpoint backbone if available
+    model_path = os.path.join(os.path.dirname(__file__), "models", "dobot_bc_policy.pth")
+    if os.path.exists(model_path):
+        try:
+            ckpt = torch.load(model_path, map_location="cpu")
+            bb_state = {}
+            for k, v in ckpt.items():
+                if k.startswith("backbone."):
+                    bb_state[k.replace("backbone.", "")] = v
+            if bb_state:
+                embedder.load_state_dict(bb_state, strict=False)
+                print("[INFO] Loaded trained backbone checkpoint in visualizer.", flush=True)
+        except Exception as e:
+            print(f"[WARN] Could not load checkpoint weights into visualizer: {e}", flush=True)
+
     while running:
         prompt_text = sim.instruction
         token_ids = tokenizer.encode(prompt_text, max_len=16)
@@ -66,7 +81,7 @@ def visualize_all_smolvla_inputs():
         img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)
         tokens_t = token_ids.unsqueeze(0)
         with torch.no_grad():
-            text_feats, vis_feats, cross_weights = embedder(tokens_t, img_t)
+            text_feats, vis_feats, cross_weights, grounded_2d = embedder(tokens_t, img_t)
             all_tokens_weights = cross_weights[0].numpy() # [16, 256]
             cur_grid = cross_weights[0, selected_token_idx].view(16, 16).numpy()
 
