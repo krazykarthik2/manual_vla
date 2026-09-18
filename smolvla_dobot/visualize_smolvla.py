@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import torch
 import numpy as np
@@ -75,7 +75,7 @@ def visualize_all_smolvla_inputs():
         img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0)
         tokens_t = token_ids.unsqueeze(0)
         with torch.no_grad():
-            text_feats, vis_feats, cross_weights, grounded_2d = embedder(tokens_t, img_t)
+            text_feats, vis_feats, cross_weights = embedder(tokens_t, img_t)
             all_tokens_weights = cross_weights[0].numpy() # [77, 49]
             cur_grid = cross_weights[0, selected_token_idx].view(7, 7).numpy()
 

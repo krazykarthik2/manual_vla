@@ -1,4 +1,4 @@
-﻿import math
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -100,11 +100,10 @@ class MultimodalCrossAttentionBlock(nn.Module):
 
 class SmolVLABackbone(nn.Module):
     """
-    Pretrained VLM-backed SmolVLA Backbone:
-    - Genuine pretrained ViT-B/32 encoder (49 patches + 77 BPE tokens)
+    Pretrained VLM Backbone:
+    - Genuine pretrained OpenAI CLIP ViT-B/32 encoder (49 patches + 77 BPE tokens)
     - Projections from 512 -> d_model (128)
-    - Multimodal Transformer fusion layers
-    - Differentiable soft-argmax grounded 2D target estimation from token-patch cross attention
+    - Multimodal Cross & Self-Attention Fusion layers
     """
     def __init__(self, d_model=128, vlm_dim=512, nhead=4, num_layers=2, device='cpu'):
         super().__init__()
@@ -124,39 +123,22 @@ class SmolVLABackbone(nn.Module):
             MultimodalCrossAttentionBlock(d_model=d_model, nhead=nhead, d_ff=d_model * 2)
             for _ in range(num_layers)
         ])
-        
-        self.grounding_head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model)
-        )
 
     def forward(self, text_ids, img):
         with torch.no_grad():
             vis_patches, cls_emb = self.vlm.encode_vision(img) # [B, 49, 512]
             text_feats = self.vlm.encode_text(text_ids)         # [B, 77, 512]
             
-            # Real zero-shot pretrained similarity heatmap
+            # Zero-shot pretrained similarity heatmap
             base_weights = torch.einsum('bld,bpd->blp', text_feats, vis_patches) # [B, 77, 49]
             base_probs = F.softmax(base_weights * 5.0, dim=-1)
 
         # Project 512 -> 128
-        cur_txt = self.txt_proj(text_feats[:, :16]) # Take top 16 active tokens for fast transformer
+        cur_txt = self.txt_proj(text_feats[:, :16]) # [B, 16, 128]
         cur_vis = self.vis_proj(vis_patches)        # [B, 49, 128]
 
         for layer in self.layers:
             cur_txt, cur_vis, _ = layer(cur_txt, cur_vis)
 
-        # Differentiable soft-argmax 2D coordinate extraction
-        txt_q = self.grounding_head(cur_txt.mean(dim=1)) # [B, 128]
-        attn_logits = torch.bmm(txt_q.unsqueeze(1), cur_vis.transpose(1, 2)) / (self.d_model ** 0.5) # [B, 1, 49]
-        spatial_probs = F.softmax(attn_logits * 4.0, dim=-1)
-        
-        grid_x = self.vlm.grid_x.to(img.device)
-        grid_y = self.vlm.grid_y.to(img.device)
-        gx = (spatial_probs * grid_x).sum(dim=-1)
-        gy = (spatial_probs * grid_y).sum(dim=-1)
-        grounded_2d = torch.cat([gx, gy], dim=-1) # [B, 2]
+        return cur_txt, cur_vis, base_probs
 
-        return cur_txt, cur_vis, base_probs, grounded_2d

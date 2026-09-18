@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import time
 import torch
@@ -25,7 +25,7 @@ def run_smolvla(fast_mode=False):
         sys.exit(1)
 
     try:
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
         model.eval()
         print(f"[INFO] SmolVLA Model (Pretrained VLM ViT-B/32) loaded successfully from {model_path}!", flush=True)
     except Exception as e:
@@ -150,9 +150,13 @@ def run_smolvla(fast_mode=False):
                         else:
                             traj_step += 2 if lightspeed else 1
 
-                        dist_to_plat_2d = np.linalg.norm(sim.ee_pos[:2] - sim.target_platform_pos[:2])
-                        if sim.grasped and dist_to_plat_2d < 0.035 and sim.ee_pos[2] <= 0.045:
+                        dist_to_cube = np.linalg.norm(sim.ee_pos[:3] - sim.target_cube_pos)
+                        d_plat = np.linalg.norm(sim.target_cube_pos[:2] - sim.target_platform_pos[:2])
+
+                        if sim.grasped and d_plat < 0.038 and sim.ee_pos[2] < 0.035:
                             grip_cmd = 0.0 # Autonomous placement release
+                        elif (dist_to_cube < 0.035 and sim.ee_pos[2] < 0.040) or sim.grasped:
+                            grip_cmd = 1.0 # Secure grasp
                         else:
                             grip_cmd = 1.0 if target_point[3] > 0.35 else 0.0
 

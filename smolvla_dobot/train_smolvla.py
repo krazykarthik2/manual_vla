@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import glob
 import math
@@ -96,10 +96,9 @@ class SmolVLAPolicy(nn.Module):
             nn.Linear(d_model, d_model)
         )
 
-        # 3. Action Decoder Queries & 2-Layer Transformer Cross-Attention Head
+        # 3. Action Decoder Queries & Transformer Cross-Attention Head
         self.action_in_proj = nn.Linear(action_dim, d_model)
         self.pos_queries = nn.Parameter(torch.randn(1, horizon, d_model) * 0.02)
-        self.grounded_proj = nn.Linear(2, d_model)
 
         self.dec_sa1 = nn.MultiheadAttention(d_model, 4, batch_first=True)
         self.dec_ca1 = nn.MultiheadAttention(d_model, 4, batch_first=True)
@@ -127,32 +126,21 @@ class SmolVLAPolicy(nn.Module):
         B = vis_patches.size(0)
 
         # Project 512 -> 128
-        cur_txt = self.backbone.txt_proj(text_feats[:, :16])
-        cur_vis = self.backbone.vis_proj(vis_patches)
+        cur_txt = self.backbone.txt_proj(text_feats[:, :16]) # [B, 16, 128]
+        cur_vis = self.backbone.vis_proj(vis_patches)        # [B, 49, 128]
 
-        # Cross attention layers
+        # Multimodal fusion layers: language attends to vision, self-attends joint tokens
         for layer in self.backbone.layers:
             cur_txt, cur_vis, _ = layer(cur_txt, cur_vis)
 
-        # Soft-argmax 2D coordinate extraction
-        txt_q = self.backbone.grounding_head(cur_txt.mean(dim=1))
-        attn_logits = torch.bmm(txt_q.unsqueeze(1), cur_vis.transpose(1, 2)) / (self.d_model ** 0.5)
-        spatial_probs = F.softmax(attn_logits * 4.0, dim=-1)
-        grid_x = self.backbone.vlm.grid_x.to(vis_patches.device)
-        grid_y = self.backbone.vlm.grid_y.to(vis_patches.device)
-        gx = (spatial_probs * grid_x).sum(dim=-1)
-        gy = (spatial_probs * grid_y).sum(dim=-1)
-        grounded_2d = torch.cat([gx, gy], dim=-1)
-
-        # Conditioning
+        # Conditioning tokens: Proprioception + Continuous Diffusion Time
         if proprio is None:
             proprio = torch.zeros(B, 5, device=vis_patches.device)
-        p_token = self.proprio_proj(proprio).unsqueeze(1)
-        t_token = self.time_embed(t).unsqueeze(1)
-        g_token = self.grounded_proj(grounded_2d).unsqueeze(1)
+        p_token = self.proprio_proj(proprio).unsqueeze(1) # [B, 1, 128]
+        t_token = self.time_embed(t).unsqueeze(1)         # [B, 1, 128]
 
-        # Joint Multimodal Context: 1 + 1 + 1 + 16 + 49 = 68 tokens
-        context = torch.cat([g_token, p_token, t_token, cur_txt, cur_vis], dim=1)
+        # Joint Multimodal Context: [proprio, time, text_tokens (16), visual_patches (49)] = 67 tokens
+        context = torch.cat([p_token, t_token, cur_txt, cur_vis], dim=1)
 
         # Action Decoder Stream
         act_queries = self.action_in_proj(x_t) + self.pos_queries
@@ -172,7 +160,7 @@ class SmolVLAPolicy(nn.Module):
         act_queries = self.dec_n6(act_queries + self.dec_ffn2(act_queries))
 
         v_pred = self.out_head(act_queries)
-        return v_pred, grounded_2d
+        return v_pred
 
     def forward_flow(self, x_t, t, img, token_ids, proprio=None):
         with torch.no_grad():
@@ -191,7 +179,7 @@ class SmolVLAPolicy(nn.Module):
 
         for i in range(num_steps):
             t = torch.full((B,), (i + 0.5) * dt, device=img.device)
-            v, _ = self.forward_from_embeddings(x, t, vis_patches, text_feats, proprio=proprio)
+            v = self.forward_from_embeddings(x, t, vis_patches, text_feats, proprio=proprio)
             x = x + v * dt
 
         raw_x = x * ACTION_STD.to(img.device) + ACTION_MEAN.to(img.device)
@@ -208,8 +196,36 @@ class SmolVLAPolicy(nn.Module):
 class FastSmolVLADataset(Dataset):
     def __init__(self, data_dir, cache_file=CACHE_FILE):
         if not os.path.exists(cache_file):
-            raise ValueError(f"Cache file {cache_file} missing!")
-            
+            print(f">> Cache file {cache_file} not found. Generating cache automatically on {DEVICE}...", flush=True)
+            files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
+            if not files:
+                print(">> No demonstrations found. Generating 100 clean demonstrations first...", flush=True)
+                from auto_generate_demos import run_auto_demonstrator
+                run_auto_demonstrator(num_demos=100)
+                files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
+
+            vlm = PretrainedVLMEncoder(device=DEVICE)
+            cached_patches = []
+            cached_txt = []
+            print(f">> Caching CLIP visual patches & text tokens for {len(files)} demonstrations...", flush=True)
+            for f in tqdm(files, desc="VLM Caching"):
+                d = np.load(f, allow_pickle=True)
+                img = torch.tensor(d['images'][0], dtype=torch.float32).unsqueeze(0).to(DEVICE)
+                toks = clip.tokenize([str(d['prompt'][0])]).to(DEVICE)
+                with torch.no_grad():
+                    p, _ = vlm.encode_vision(img)
+                    t = vlm.encode_text(toks)
+                cached_patches.append(p[0].cpu())
+                cached_txt.append(t[0].cpu())
+
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            torch.save({
+                'files': files,
+                'patches': torch.stack(cached_patches),
+                'txt_feats': torch.stack(cached_txt)
+            }, cache_file)
+            print(f">> Saved cache -> {cache_file}", flush=True)
+
         print(f">> Loading Pretrained VLM features from {cache_file}...", flush=True)
         cache = torch.load(cache_file, map_location="cpu")
         files = cache['files']
@@ -226,20 +242,11 @@ class FastSmolVLADataset(Dataset):
             norm_traj = (torch.tensor(raw_traj, dtype=torch.float32) - ACTION_MEAN) / (ACTION_STD + 1e-6)
             proprio0 = proprio[0]
 
-            if 'observations' in d and len(d['observations']) > 0:
-                cx_phys, cy_phys = d['observations'][0][5:7]
-                px = 32.0 + (cy_phys / 0.28) * 28.0
-                py = 58.0 - ((cx_phys - 0.10) / 0.25) * 52.0
-                target_2d = np.array([(px - 31.5) / 31.5, (py - 31.5) / 31.5], dtype=np.float32)
-            else:
-                target_2d = np.zeros(2, dtype=np.float32)
-
             self.samples.append((
                 cached_patches[idx],
                 cached_txt[idx],
                 torch.tensor(proprio0, dtype=torch.float32),
-                norm_traj,
-                torch.tensor(target_2d, dtype=torch.float32)
+                norm_traj
             ))
 
         print(f">> Loaded {len(self.samples)} cached demonstration trajectories.", flush=True)
@@ -258,7 +265,7 @@ def train(epochs=150, batch_size=16, lr=1.5e-3):
     print("=" * 68, flush=True)
     print("   SmolVLA Policy with Real Pretrained VLM (OpenAI CLIP ViT-B/32)", flush=True)
     print("   - Genuine 49 ViT Patch Embeddings + 77 Pretrained Language Tokens", flush=True)
-    print("   - Multimodal Cross-Attention Action Decoder + Spatial Grounding", flush=True)
+    print("   - Multimodal Action Expert (Cross-Attention Action Decoder)", flush=True)
     print(f"   - Hardware Compute Engine: {DEVICE}", flush=True)
     print("=" * 68, flush=True)
 
@@ -284,12 +291,11 @@ def train(epochs=150, batch_size=16, lr=1.5e-3):
     try:
         for epoch in epoch_pbar:
             total_loss = 0.0
-            for vis_patches, txt_feats, proprio, x_1, target_2d in dataloader:
+            for vis_patches, txt_feats, proprio, x_1 in dataloader:
                 vis_patches = vis_patches.to(DEVICE)
                 txt_feats = txt_feats.to(DEVICE)
                 proprio = proprio.to(DEVICE)
                 x_1 = x_1.to(DEVICE)
-                target_2d = target_2d.to(DEVICE)
 
                 B = vis_patches.size(0)
                 optimizer.zero_grad(set_to_none=True)
@@ -301,27 +307,24 @@ def train(epochs=150, batch_size=16, lr=1.5e-3):
                 x_t = (1.0 - t_expanded) * x_0 + t_expanded * x_1
                 u_t = x_1 - x_0
 
-                v_pred, pred_grounded_2d = model.forward_from_embeddings(x_t, t, vis_patches, txt_feats, proprio=proprio)
+                v_pred = model.forward_from_embeddings(x_t, t, vis_patches, txt_feats, proprio=proprio)
 
-                # 1. Flow-matching velocity vector loss
+                # Flow-matching velocity vector loss
                 loss_raw = loss_fn(v_pred, u_t)
                 dim_weights = torch.tensor([1.2, 1.2, 1.5, 2.5], device=DEVICE).view(1, 1, 4)
                 flow_loss = (loss_raw * dim_weights).mean()
 
-                # 2. Auxiliary Spatial Grounding Loss
-                grounding_loss = F.mse_loss(pred_grounded_2d, target_2d)
-
-                total_batch_loss = flow_loss + 0.30 * grounding_loss
-                total_batch_loss.backward()
+                flow_loss.backward()
                 optimizer.step()
-                total_loss += total_batch_loss.item() * B
+                total_loss += flow_loss.item() * B
 
             scheduler.step()
             avg_loss = total_loss / len(dataset)
 
             if avg_loss < best_loss or epoch % 10 == 0:
                 best_loss = min(best_loss, avg_loss)
-                safe_save_model(model.state_dict(), model_path)
+                filtered = {k: v for k, v in model.state_dict().items() if not k.startswith("backbone.vlm.clip.")}
+                safe_save_model(filtered, model_path)
 
             current_lr = scheduler.get_last_lr()[0]
             epoch_pbar.set_postfix({
@@ -332,10 +335,12 @@ def train(epochs=150, batch_size=16, lr=1.5e-3):
 
     except KeyboardInterrupt:
         print("\n[INFO] Training interrupted. Saving checkpoint...", flush=True)
-        safe_save_model(model.state_dict(), model_path)
+        filtered = {k: v for k, v in model.state_dict().items() if not k.startswith("backbone.vlm.clip.")}
+        safe_save_model(filtered, model_path)
         return
 
-    safe_save_model(model.state_dict(), model_path)
+    filtered = {k: v for k, v in model.state_dict().items() if not k.startswith("backbone.vlm.clip.")}
+    safe_save_model(filtered, model_path)
     print(f"\n[SUCCESS] SmolVLA Model Checkpoint saved -> {model_path}", flush=True)
 
 if __name__ == "__main__":

@@ -176,25 +176,26 @@ class DobotPickPlaceSim:
             py = int(58 - ((x - 0.10) / 0.25) * 52)
             return px, py
 
-        # Platforms
+        # Platforms (clear distinct colored targets)
         for plat_color, p_pos in self.distractor_platforms:
             gx, gy = to_cam_px(p_pos[0], p_pos[1])
             col = COLOR_PALETTE.get(plat_color, (40, 210, 80))
-            pygame.draw.rect(surf, col, (gx - 5, gy - 5, 10, 10), border_radius=1)
+            pygame.draw.rect(surf, col, (gx - 7, gy - 7, 15, 15), border_radius=2)
 
         tgx, tgy = to_cam_px(self.target_platform_pos[0], self.target_platform_pos[1])
         t_col = COLOR_PALETTE.get(self.target_plat_color, (40, 210, 80))
-        pygame.draw.rect(surf, t_col, (tgx - 5, tgy - 5, 10, 10), border_radius=1)
+        pygame.draw.rect(surf, t_col, (tgx - 7, tgy - 7, 15, 15), border_radius=2)
+        pygame.draw.rect(surf, (255, 255, 255), (tgx - 7, tgy - 7, 15, 15), 1, border_radius=2)
 
-        # Cubes
+        # Cubes (prominent colored squares)
         for cube_color, c_pos in self.distractor_cubes:
             cx, cy = to_cam_px(c_pos[0], c_pos[1])
             col = COLOR_PALETTE.get(cube_color, (45, 120, 240))
-            pygame.draw.rect(surf, col, (cx - 3, cy - 3, 6, 6))
+            pygame.draw.rect(surf, col, (cx - 5, cy - 5, 11, 11), border_radius=1)
 
         tcx, tcy = to_cam_px(self.target_cube_pos[0], self.target_cube_pos[1])
         tc_col = COLOR_PALETTE.get(self.target_color, (240, 45, 45))
-        pygame.draw.rect(surf, tc_col, (tcx - 3, tcy - 3, 6, 6))
+        pygame.draw.rect(surf, tc_col, (tcx - 5, tcy - 5, 11, 11), border_radius=1)
 
         # Base & Linkage
         bx, by = to_cam_px(0.08, 0.0)
