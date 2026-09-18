@@ -32,7 +32,10 @@ class PretrainedVLMEncoder(nn.Module):
     def encode_vision(self, img):
         # img: [B, 3, 64, 64] float in [0, 1]
         img_224 = F.interpolate(img, size=(224, 224), mode='bilinear', align_corners=False)
-        x = (img_224 - self.img_mean) / self.img_std
+        # Ensure normalization tensors are on the same device as the input
+        img_mean = self.img_mean.to(img.device)
+        img_std = self.img_std.to(img.device)
+        x = (img_224 - img_mean) / img_std
         
         vis = self.clip.visual
         x = vis.conv1(x) # [B, 768, 7, 7]
