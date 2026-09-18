@@ -163,7 +163,7 @@ def visualize_all_smolvla_inputs():
 
                             # Compute cross-attention weights
                             base_weights = torch.einsum('bld,bpd->blp', text_feats.float(), vis_patches.float())
-                            cached_cross_weights = torch.softmax(base_weights * 5.0, dim=-1)[0].cpu().numpy()
+                            cached_cross_weights = torch.softmax(base_weights * 50.0, dim=-1)[0].cpu().numpy()
 
                             sample_steps = 10 if speed_mode == 1 else 15
                             current_trajectory = model.sample(img_t, tokens_t, proprio=proprio_t, num_steps=sample_steps).squeeze(0).cpu().numpy()
@@ -198,7 +198,7 @@ def visualize_all_smolvla_inputs():
                 vis_patches, _ = model.backbone.vlm.encode_vision(img_t)
                 text_feats = model.backbone.vlm.encode_text(tokens_t)
                 base_weights = torch.einsum('bld,bpd->blp', text_feats.float(), vis_patches.float())
-                cached_cross_weights = torch.softmax(base_weights * 5.0, dim=-1)[0].cpu().numpy()
+                cached_cross_weights = torch.softmax(base_weights * 50.0, dim=-1)[0].cpu().numpy()
 
         all_tokens_weights = cached_cross_weights  # [77, 49]
         cur_grid = all_tokens_weights[selected_token_idx].reshape(7, 7)
@@ -268,6 +268,7 @@ def visualize_all_smolvla_inputs():
 
         g_min, g_max = cur_grid.min(), cur_grid.max()
         cur_grid_norm = (cur_grid - g_min) / (g_max - g_min + 1e-6) if g_max > g_min else cur_grid
+        cur_grid_norm = cur_grid_norm ** 2  # power-law sharpening: suppress low, amplify high
 
         cell_sz = 34
         start_x, start_y = 277, 100
@@ -327,6 +328,7 @@ def visualize_all_smolvla_inputs():
             t_grid = all_tokens_weights[t_idx].reshape(7, 7)
             tg_min, tg_max = t_grid.min(), t_grid.max()
             tg_norm = (t_grid - tg_min) / (tg_max - tg_min + 1e-6) if tg_max > tg_min else t_grid
+            tg_norm = tg_norm ** 2  # power-law sharpening
 
             for r in range(7):
                 for c in range(7):
