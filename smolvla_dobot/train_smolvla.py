@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import glob
 import math
@@ -9,11 +9,12 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+import clip
 
+sys.path.append(os.path.dirname(__file__))
 from smolvla_embedding import SmolVLMTokenizer
-from smolvla_model import SmolVLABackbone
+from smolvla_model import SmolVLABackbone, PretrainedVLMEncoder
 
-# Device Configuration (Auto CUDA / Multi-core CPU)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if DEVICE.type == "cpu":
     NUM_CORES = os.cpu_count() or 4
@@ -22,6 +23,7 @@ if DEVICE.type == "cpu":
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "demonstrations")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
+CACHE_FILE = os.path.join(os.path.dirname(__file__), "data", "vlm_features_cache.pt")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 def safe_save_model(state_dict, path):
@@ -49,7 +51,6 @@ def safe_save_model(state_dict, path):
             import time
             time.sleep(0.1)
 
-# Empirical normalization constants for 4D actions (X, Y, Z, Gripper) matching 100% pick-and-place dataset
 ACTION_MEAN = torch.tensor([0.2028, 0.0008, 0.0854, 0.5360], dtype=torch.float32)
 ACTION_STD  = torch.tensor([0.0330, 0.0837, 0.0362, 0.4987], dtype=torch.float32)
 
@@ -64,23 +65,23 @@ class ContinuousSinusoidalTimeEmbedding(nn.Module):
         return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
 # -----------------------------------------------------------------------------
-# 1. SmolVLA Policy Architecture with True ViT & Multimodal Cross-Attention
+# 1. SmolVLA Policy with Real Pretrained VLM Backbone
 # -----------------------------------------------------------------------------
 class SmolVLAPolicy(nn.Module):
     """
-    True SmolVLA Policy:
-    - Backbone: SmolVLABackbone (ViT Patch Encoder + Multimodal Self/Cross Attention)
-    - Inputs: Subword Language Token IDs + 64x64 Overhead Image + 5D Proprioception
-    - Action Head: Flow Matching Vector Field Regressor over Horizon H=128
+    Genuine SmolVLA Policy:
+    - Backbone: Pretrained OpenAI CLIP ViT-B/32 (49 Visual Patches + 77 BPE Language Tokens)
+    - Projections into d_model=128 for real-time inference & training
+    - Multimodal Cross-Attention Action Decoder over Horizon H=128
     """
-    def __init__(self, vocab_size=32, horizon=128, action_dim=4, d_model=128, num_layers=2):
+    def __init__(self, horizon=128, action_dim=4, d_model=128, num_layers=2):
         super().__init__()
         self.horizon = horizon
         self.action_dim = action_dim
         self.d_model = d_model
 
-        # 1. Multimodal Backbone (Language + ViT 256 Patches)
-        self.backbone = SmolVLABackbone(vocab_size=vocab_size, d_model=d_model, text_len=16, nhead=4, num_layers=num_layers)
+        # 1. Real Pretrained VLM Backbone
+        self.backbone = SmolVLABackbone(d_model=d_model, nhead=4, num_layers=num_layers)
 
         # 2. Proprioception & Time Conditioning
         self.proprio_proj = nn.Sequential(
@@ -122,52 +123,75 @@ class SmolVLAPolicy(nn.Module):
             nn.Linear(d_model, action_dim)
         )
 
-    def forward_flow(self, x_t, t, img, token_ids, proprio=None):
-        B = img.size(0)
+    def forward_from_embeddings(self, x_t, t, vis_patches, text_feats, proprio=None):
+        B = vis_patches.size(0)
 
-        # 1. Multimodal feature extraction through CoordConv + Cross Attention
-        text_feats, vis_feats, _, grounded_2d = self.backbone(token_ids, img) # text: [B, 16, d], vis: [B, 256, d]
+        # Project 512 -> 128
+        cur_txt = self.backbone.txt_proj(text_feats[:, :16])
+        cur_vis = self.backbone.vis_proj(vis_patches)
 
-        # 2. Proprioception, Time, and Grounded Spatial Target conditioning
+        # Cross attention layers
+        for layer in self.backbone.layers:
+            cur_txt, cur_vis, _ = layer(cur_txt, cur_vis)
+
+        # Soft-argmax 2D coordinate extraction
+        txt_q = self.backbone.grounding_head(cur_txt.mean(dim=1))
+        attn_logits = torch.bmm(txt_q.unsqueeze(1), cur_vis.transpose(1, 2)) / (self.d_model ** 0.5)
+        spatial_probs = F.softmax(attn_logits * 4.0, dim=-1)
+        grid_x = self.backbone.vlm.grid_x.to(vis_patches.device)
+        grid_y = self.backbone.vlm.grid_y.to(vis_patches.device)
+        gx = (spatial_probs * grid_x).sum(dim=-1)
+        gy = (spatial_probs * grid_y).sum(dim=-1)
+        grounded_2d = torch.cat([gx, gy], dim=-1)
+
+        # Conditioning
         if proprio is None:
-            proprio = torch.zeros(B, 5, device=img.device)
-        p_token = self.proprio_proj(proprio).unsqueeze(1) # [B, 1, d]
-        t_token = self.time_embed(t).unsqueeze(1)         # [B, 1, d]
-        g_token = self.grounded_proj(grounded_2d).unsqueeze(1) # [B, 1, d]
+            proprio = torch.zeros(B, 5, device=vis_patches.device)
+        p_token = self.proprio_proj(proprio).unsqueeze(1)
+        t_token = self.time_embed(t).unsqueeze(1)
+        g_token = self.grounded_proj(grounded_2d).unsqueeze(1)
 
-        # Joint Multimodal Context: 1 (grounded target) + 1 (proprio) + 1 (time) + 16 (text) + 256 (vis) = 275 tokens
-        context = torch.cat([g_token, p_token, t_token, text_feats, vis_feats], dim=1) # [B, 275, d]
+        # Joint Multimodal Context: 1 + 1 + 1 + 16 + 49 = 68 tokens
+        context = torch.cat([g_token, p_token, t_token, cur_txt, cur_vis], dim=1)
 
-        # 3. Action Decoder Stream (2-layer transformer decoder)
-        act_queries = self.action_in_proj(x_t) + self.pos_queries # [B, horizon, d]
+        # Action Decoder Stream
+        act_queries = self.action_in_proj(x_t) + self.pos_queries
 
-        # Decoder Layer 1
+        # Layer 1
         sa_out, _ = self.dec_sa1(act_queries, act_queries, act_queries)
         act_queries = self.dec_n1(act_queries + sa_out)
         ca_out, _ = self.dec_ca1(act_queries, context, context)
         act_queries = self.dec_n2(act_queries + ca_out)
         act_queries = self.dec_n3(act_queries + self.dec_ffn1(act_queries))
 
-        # Decoder Layer 2
+        # Layer 2
         sa_out2, _ = self.dec_sa2(act_queries, act_queries, act_queries)
         act_queries = self.dec_n4(act_queries + sa_out2)
         ca_out2, _ = self.dec_ca2(act_queries, context, context)
         act_queries = self.dec_n5(act_queries + ca_out2)
         act_queries = self.dec_n6(act_queries + self.dec_ffn2(act_queries))
 
-        # 4. Predict velocity field
-        v_pred = self.out_head(act_queries) # [B, horizon, 4]
+        v_pred = self.out_head(act_queries)
         return v_pred, grounded_2d
 
+    def forward_flow(self, x_t, t, img, token_ids, proprio=None):
+        with torch.no_grad():
+            vis_patches, _ = self.backbone.vlm.encode_vision(img)
+            text_feats = self.backbone.vlm.encode_text(token_ids)
+        return self.forward_from_embeddings(x_t, t, vis_patches, text_feats, proprio=proprio)
+
     @torch.no_grad()
-    def sample(self, img, token_ids, proprio=None, num_steps=20):
+    def sample(self, img, token_ids, proprio=None, num_steps=15):
         B = img.size(0)
         x = torch.randn(B, self.horizon, self.action_dim, device=img.device)
         dt = 1.0 / num_steps
 
+        vis_patches, _ = self.backbone.vlm.encode_vision(img)
+        text_feats = self.backbone.vlm.encode_text(token_ids)
+
         for i in range(num_steps):
             t = torch.full((B,), (i + 0.5) * dt, device=img.device)
-            v, _ = self.forward_flow(x, t, img, token_ids, proprio=proprio)
+            v, _ = self.forward_from_embeddings(x, t, vis_patches, text_feats, proprio=proprio)
             x = x + v * dt
 
         raw_x = x * ACTION_STD.to(img.device) + ACTION_MEAN.to(img.device)
@@ -179,32 +203,29 @@ class SmolVLAPolicy(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# 2. Dataset with Language Tokenizer
+# 2. Fast Cached Dataset
 # -----------------------------------------------------------------------------
-class SmolVLADataset(Dataset):
-    def __init__(self, data_dir):
-        files = sorted(glob.glob(os.path.join(data_dir, "demo_*.npz")))
-        if not files:
-            raise ValueError(f"No demonstration files found in {data_dir}. Run auto_generate_demos.py first!")
-
-        self.tokenizer = SmolVLMTokenizer()
-        self.samples = []
-        print(f">> Indexing {len(files)} demonstrations for SmolVLA Training...", flush=True)
-
-        for f in files:
-            d = np.load(f, allow_pickle=True)
-            img0 = d['images'][0].astype(np.float32) # [3, 64, 64]
-            proprio = d['proprioception'].astype(np.float32) # [128, 5]
-            acts = d['actions'].astype(np.float32) # [128, 6]
+class FastSmolVLADataset(Dataset):
+    def __init__(self, data_dir, cache_file=CACHE_FILE):
+        if not os.path.exists(cache_file):
+            raise ValueError(f"Cache file {cache_file} missing!")
             
-            prompt_str = str(d['prompt'][0]) if 'prompt' in d else "pick up the red cube and place it on the green platform"
-            token_ids = self.tokenizer.encode(prompt_str, max_len=16)
+        print(f">> Loading Pretrained VLM features from {cache_file}...", flush=True)
+        cache = torch.load(cache_file, map_location="cpu")
+        files = cache['files']
+        cached_patches = cache['patches']
+        cached_txt = cache['txt_feats']
 
-            raw_traj = np.concatenate([proprio[:, :3], acts[:, 4:5]], axis=-1) # [128, 4]
+        self.samples = []
+        for idx, f in enumerate(files):
+            d = np.load(f, allow_pickle=True)
+            proprio = d['proprioception'].astype(np.float32)
+            acts = d['actions'].astype(np.float32)
+
+            raw_traj = np.concatenate([proprio[:, :3], acts[:, 4:5]], axis=-1)
             norm_traj = (torch.tensor(raw_traj, dtype=torch.float32) - ACTION_MEAN) / (ACTION_STD + 1e-6)
-            proprio0 = proprio[0] # [5]
+            proprio0 = proprio[0]
 
-            # Ground truth 2D target cube coordinate in normalized image space [-1, 1]
             if 'observations' in d and len(d['observations']) > 0:
                 cx_phys, cy_phys = d['observations'][0][5:7]
                 px = 32.0 + (cy_phys / 0.28) * 28.0
@@ -213,56 +234,64 @@ class SmolVLADataset(Dataset):
             else:
                 target_2d = np.zeros(2, dtype=np.float32)
 
-            self.samples.append((img0, token_ids, proprio0, norm_traj, target_2d))
+            self.samples.append((
+                cached_patches[idx],
+                cached_txt[idx],
+                torch.tensor(proprio0, dtype=torch.float32),
+                norm_traj,
+                torch.tensor(target_2d, dtype=torch.float32)
+            ))
 
-        print(f">> Successfully indexed {len(self.samples)} trajectory demonstrations with subword language tokens.", flush=True)
+        print(f">> Loaded {len(self.samples)} cached demonstration trajectories.", flush=True)
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img, token_ids, proprio0, norm_traj, target_2d = self.samples[idx]
-        return torch.tensor(img, dtype=torch.float32), token_ids, torch.tensor(proprio0, dtype=torch.float32), norm_traj, torch.tensor(target_2d, dtype=torch.float32)
+        return self.samples[idx]
 
 
 # -----------------------------------------------------------------------------
 # 3. Flow Matching Training
 # -----------------------------------------------------------------------------
-def train(epochs=200, batch_size=16, lr=1.8e-3):
+def train(epochs=150, batch_size=16, lr=1.5e-3):
     print("=" * 68, flush=True)
-    print("   SmolVLA Spatially Grounded Multimodal Flow-Matching Policy", flush=True)
-    print("   - CoordConv Spatial Feature Pyramid + Soft-Argmax Target Grounding", flush=True)
-    print("   - 2-Layer Transformer Action Decoder with Dual Cross-Attention", flush=True)
-    print(f"   - Hardware Compute Engine: {DEVICE} ({'CUDA GPU Acceleration' if DEVICE.type == 'cuda' else 'Optimized Multi-core CPU'})", flush=True)
+    print("   SmolVLA Policy with Real Pretrained VLM (OpenAI CLIP ViT-B/32)", flush=True)
+    print("   - Genuine 49 ViT Patch Embeddings + 77 Pretrained Language Tokens", flush=True)
+    print("   - Multimodal Cross-Attention Action Decoder + Spatial Grounding", flush=True)
+    print(f"   - Hardware Compute Engine: {DEVICE}", flush=True)
     print("=" * 68, flush=True)
 
-    dataset = SmolVLADataset(DATA_DIR)
+    dataset = FastSmolVLADataset(DATA_DIR)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    model = SmolVLAPolicy(vocab_size=len(dataset.tokenizer.vocab), d_model=128, num_layers=2).to(DEVICE)
+    model = SmolVLAPolicy(d_model=128, num_layers=2).to(DEVICE)
     model.train()
 
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    print(f">> Trainable Policy Parameters: {sum(p.numel() for p in trainable_params):,}", flush=True)
+
+    optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     loss_fn = nn.MSELoss(reduction='none')
 
     model_path = os.path.join(MODEL_DIR, "dobot_bc_policy.pth")
     best_loss = float("inf")
 
-    print(f"\n>> Training SmolVLA Policy across {len(dataset)} demonstrations ({epochs} epochs)...", flush=True)
+    print(f"\n>> Training Pretrained SmolVLA Policy across {len(dataset)} demonstrations ({epochs} epochs)...", flush=True)
     epoch_pbar = tqdm(range(1, epochs + 1), desc="Training SmolVLA")
 
     try:
         for epoch in epoch_pbar:
             total_loss = 0.0
-            for img, token_ids, proprio, x_1, target_2d in dataloader:
-                img = img.to(DEVICE)
-                token_ids = token_ids.to(DEVICE)
+            for vis_patches, txt_feats, proprio, x_1, target_2d in dataloader:
+                vis_patches = vis_patches.to(DEVICE)
+                txt_feats = txt_feats.to(DEVICE)
                 proprio = proprio.to(DEVICE)
                 x_1 = x_1.to(DEVICE)
                 target_2d = target_2d.to(DEVICE)
 
-                B = img.size(0)
+                B = vis_patches.size(0)
                 optimizer.zero_grad(set_to_none=True)
 
                 x_0 = torch.randn_like(x_1)
@@ -272,17 +301,17 @@ def train(epochs=200, batch_size=16, lr=1.8e-3):
                 x_t = (1.0 - t_expanded) * x_0 + t_expanded * x_1
                 u_t = x_1 - x_0
 
-                v_pred, pred_grounded_2d = model.forward_flow(x_t, t, img, token_ids, proprio=proprio)
+                v_pred, pred_grounded_2d = model.forward_from_embeddings(x_t, t, vis_patches, txt_feats, proprio=proprio)
 
                 # 1. Flow-matching velocity vector loss
                 loss_raw = loss_fn(v_pred, u_t)
                 dim_weights = torch.tensor([1.2, 1.2, 1.5, 2.5], device=DEVICE).view(1, 1, 4)
                 flow_loss = (loss_raw * dim_weights).mean()
 
-                # 2. Auxiliary Spatial Grounding Loss: ensures cross-attention accurately pinpoints target cube in 2D
+                # 2. Auxiliary Spatial Grounding Loss
                 grounding_loss = F.mse_loss(pred_grounded_2d, target_2d)
 
-                total_batch_loss = flow_loss + 0.50 * grounding_loss
+                total_batch_loss = flow_loss + 0.30 * grounding_loss
                 total_batch_loss.backward()
                 optimizer.step()
                 total_loss += total_batch_loss.item() * B
@@ -290,7 +319,7 @@ def train(epochs=200, batch_size=16, lr=1.8e-3):
             scheduler.step()
             avg_loss = total_loss / len(dataset)
 
-            if avg_loss < best_loss or epoch % 20 == 0:
+            if avg_loss < best_loss or epoch % 10 == 0:
                 best_loss = min(best_loss, avg_loss)
                 safe_save_model(model.state_dict(), model_path)
 
@@ -310,5 +339,5 @@ def train(epochs=200, batch_size=16, lr=1.8e-3):
     print(f"\n[SUCCESS] SmolVLA Model Checkpoint saved -> {model_path}", flush=True)
 
 if __name__ == "__main__":
-    epochs = int(sys.argv[1]) if len(sys.argv) > 1 else 200
+    epochs = int(sys.argv[1]) if len(sys.argv) > 1 else 150
     train(epochs=epochs)

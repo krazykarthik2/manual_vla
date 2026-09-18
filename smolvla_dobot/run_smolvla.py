@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import time
 import torch
@@ -6,6 +6,7 @@ import numpy as np
 import pygame
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "env"))
+sys.path.append(os.path.dirname(__file__))
 from dobot_env import DobotPickPlaceSim, COLOR_PALETTE
 from smolvla_embedding import SmolVLMTokenizer
 from train_smolvla import SmolVLAPolicy, MODEL_DIR, DEVICE
@@ -15,7 +16,7 @@ def run_smolvla(fast_mode=False):
     model_path = os.path.join(MODEL_DIR, "dobot_bc_policy.pth")
 
     tokenizer = SmolVLMTokenizer()
-    model = SmolVLAPolicy(vocab_size=len(tokenizer.vocab), d_model=128, num_layers=2).to(device)
+    model = SmolVLAPolicy(d_model=128, num_layers=2).to(device)
     if not os.path.exists(model_path):
         print("\n" + "=" * 65, flush=True)
         print(f"[ERROR] No trained checkpoint found at: {model_path}", flush=True)
@@ -26,7 +27,7 @@ def run_smolvla(fast_mode=False):
     try:
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.eval()
-        print(f"[INFO] SmolVLA Model loaded successfully from {model_path}!", flush=True)
+        print(f"[INFO] SmolVLA Model (Pretrained VLM ViT-B/32) loaded successfully from {model_path}!", flush=True)
     except Exception as e:
         print(f"[ERROR] Failed loading model checkpoint: {e}", flush=True)
         sys.exit(1)
@@ -35,7 +36,7 @@ def run_smolvla(fast_mode=False):
     pygame.init()
 
     screen = pygame.display.set_mode((760, 570))
-    pygame.display.set_caption("SmolVLA Dobot Controller (ViT Patches + Subword Tokens)")
+    pygame.display.set_caption("SmolVLA Dobot Controller (Pretrained CLIP ViT Patches + Subwords)")
 
     font_sm = pygame.font.SysFont("Arial", 11)
     font = pygame.font.SysFont("Arial", 12)
@@ -129,9 +130,9 @@ def run_smolvla(fast_mode=False):
                     if need_replan:
                         with torch.no_grad():
                             img_t = torch.tensor(obs["image"], dtype=torch.float32).unsqueeze(0).to(device)
-                            token_ids = tokenizer.encode(sim.instruction, max_len=16).unsqueeze(0).to(device)
+                            token_ids = tokenizer.encode(sim.instruction, max_len=77).unsqueeze(0).to(device)
                             proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0).to(device)
-                            sample_steps = 10 if lightspeed else 20
+                            sample_steps = 10 if lightspeed else 15
                             current_trajectory = model.sample(img_t, token_ids, proprio=proprio_t, num_steps=sample_steps).squeeze(0).cpu().numpy()
                             traj_step = 0
 
@@ -149,9 +150,6 @@ def run_smolvla(fast_mode=False):
                         else:
                             traj_step += 2 if lightspeed else 1
 
-                        # Intelligent Gripper Command:
-                        # 1. Neural continuous prediction thresholded at 0.35 (instead of strict 0.45)
-                        # 2. Touchdown Release Trigger: If cube is already over the destination platform, release gripper!
                         dist_to_plat_2d = np.linalg.norm(sim.ee_pos[:2] - sim.target_platform_pos[:2])
                         if sim.grasped and dist_to_plat_2d < 0.035 and sim.ee_pos[2] <= 0.045:
                             grip_cmd = 0.0 # Autonomous placement release
@@ -225,20 +223,17 @@ def run_smolvla(fast_mode=False):
             pygame.draw.circle(screen, (255, 170, 50), pt, 4)
         pygame.draw.circle(screen, grip_color, pts_side[-1], 7)
 
-        # Panel 3 & 4: SmolVLA Subword Tokens & ViT Patch Inset
+        # Panel 3 & 4: SmolVLA Subword Tokens & Pretrained ViT Patches
         img_hwc = (np.transpose(obs["image"], (1, 2, 0)) * 255).astype(np.uint8)
 
         pygame.draw.rect(screen, (28, 31, 40), (15, 275, 730, 135), border_radius=6)
-        screen.blit(font_bold.render("SMOLVLA MULTIMODAL INSTRUCTION & VISION TOKENS:", True, (255, 200, 100)), (25, 282))
+        screen.blit(font_bold.render("PRETRAINED VLM (ViT-B/32) INSTRUCTION & VISION TOKENS:", True, (255, 200, 100)), (25, 282))
         screen.blit(font_sm.render(f"Instruction Prompt: \"{sim.instruction}\"", True, (220, 230, 245)), (25, 305))
 
-        # Render subword token blocks
-        tok_words = tokenizer.encode(sim.instruction, max_len=12)
+        # Render active subword token blocks
+        tok_words = tokenizer.decode_active_tokens(tokenizer.encode(sim.instruction, max_len=77))
         tx = 25
-        for tid in tok_words:
-            w_str = tokenizer.id_to_token.get(tid.item(), "")
-            if w_str in ["<pad>", "<bos>", "<eos>"]:
-                continue
+        for w_str in tok_words[:10]:
             pygame.draw.rect(screen, (40, 55, 80), (tx, 335, max(45, len(w_str)*9), 22), border_radius=3)
             pygame.draw.rect(screen, (100, 180, 255), (tx, 335, max(45, len(w_str)*9), 22), 1, border_radius=3)
             screen.blit(font_sm.render(w_str, True, (255, 255, 255)), (tx + 5, 339))

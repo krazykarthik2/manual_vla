@@ -1,89 +1,77 @@
-import math
+﻿import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import clip
 
-# -----------------------------------------------------------------------------
-# 1. Spatial Coordinate Convolution (CoordConv) & Feature Pyramidal Backbone
-# -----------------------------------------------------------------------------
-class SpatialGroundedVisualEncoder(nn.Module):
+class PretrainedVLMEncoder(nn.Module):
     """
-    Spatially Grounded Visual Backbone (CoordConv + ConvNeXt-style Spatial Pyramid):
-    - Injects explicit 2D coordinate meshgrids [-1, 1] as channels into the 64x64 RGB image.
-    - Preserves 2D metric spatial geometry across spatial layers.
-    - Yields 256 tokens corresponding to a 16x16 feature grid with exact spatial calibration.
+    Extracts visual patch tokens and language token embeddings directly from
+    the real pretrained OpenAI CLIP ViT-B/32 backbone.
+    Vision: 49 patch tokens (7x7 grid) + 1 CLS global token (512-dim)
+    Language: 77 BPE token representations (512-dim)
+    Weights are frozen to preserve the pretrained multimodal feature space.
     """
-    def __init__(self, in_channels=3, d_model=128):
+    def __init__(self, device='cpu'):
         super().__init__()
-        self.d_model = d_model
+        clip_model, _ = clip.load('ViT-B/32', device=device)
+        self.clip = clip_model
+        self.clip.eval()
+        for p in self.clip.parameters():
+            p.requires_grad = False
+            
+        self.register_buffer('img_mean', torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1))
+        self.register_buffer('img_std', torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1))
         
-        # Stage 1: [B, 5, 64, 64] -> [B, 64, 32, 32]
-        self.stage1 = nn.Sequential(
-            nn.Conv2d(in_channels + 2, 64, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.GELU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.GELU()
-        )
+        # 7x7 spatial patch coordinates buffer in [-1, 1] range
+        y_g, x_g = torch.meshgrid(torch.linspace(-1, 1, 7), torch.linspace(-1, 1, 7), indexing='ij')
+        self.register_buffer('grid_x', x_g.reshape(1, 1, 49))
+        self.register_buffer('grid_y', y_g.reshape(1, 1, 49))
+
+    def encode_vision(self, img):
+        # img: [B, 3, 64, 64] float in [0, 1]
+        img_224 = F.interpolate(img, size=(224, 224), mode='bilinear', align_corners=False)
+        x = (img_224 - self.img_mean) / self.img_std
         
-        # Stage 2: [B, 64, 32, 32] -> [B, 128, 16, 16]
-        self.stage2 = nn.Sequential(
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(16, 128),
-            nn.GELU(),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.GroupNorm(16, 128),
-            nn.GELU()
-        )
+        vis = self.clip.visual
+        x = vis.conv1(x) # [B, 768, 7, 7]
+        x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1) # [B, 49, 768]
+        cls_token = vis.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
+        x = torch.cat([cls_token, x], dim=1) # [B, 50, 768]
+        x = x + vis.positional_embedding.to(x.dtype)
+        x = vis.ln_pre(x)
+        x = x.permute(1, 0, 2)
+        x = vis.transformer(x)
+        x = x.permute(1, 0, 2)
+        x = vis.ln_post(x)
         
-        # Stage 3: Projection to d_model tokens
-        self.proj = nn.Sequential(
-            nn.Conv2d(128, d_model, kernel_size=1),
-            nn.GroupNorm(16, d_model),
-            nn.GELU()
-        )
+        # Project to 512-dim
+        patches = F.normalize(x[:, 1:, :] @ vis.proj, dim=-1) # [B, 49, 512]
+        cls_emb = F.normalize(x[:, 0, :] @ vis.proj, dim=-1)   # [B, 512]
+        return patches, cls_emb
 
-        # 16x16 grid coordinates buffer
-        y_g, x_g = torch.meshgrid(torch.linspace(-1, 1, 16), torch.linspace(-1, 1, 16), indexing='ij')
-        self.register_buffer('grid_x', x_g.reshape(1, 1, 256))
-        self.register_buffer('grid_y', y_g.reshape(1, 1, 256))
+    def encode_text(self, text_tokens):
+        # text_tokens: [B, 77]
+        t_x = self.clip.token_embedding(text_tokens)
+        t_x = t_x + self.clip.positional_embedding
+        t_x = t_x.permute(1, 0, 2)
+        t_x = self.clip.transformer(t_x)
+        t_x = t_x.permute(1, 0, 2)
+        t_x = self.clip.ln_final(t_x)
+        token_embs = t_x @ self.clip.text_projection
+        return F.normalize(token_embs, dim=-1) # [B, 77, 512]
 
-    def forward(self, img):
-        # img: [B, 3, 64, 64]
-        B = img.size(0)
-        y_c, x_c = torch.meshgrid(
-            torch.linspace(-1, 1, 64, device=img.device),
-            torch.linspace(-1, 1, 64, device=img.device),
-            indexing='ij'
-        )
-        coords = torch.stack([x_c, y_c], dim=0).unsqueeze(0).repeat(B, 1, 1, 1)
-        x_in = torch.cat([img, coords], dim=1) # [B, 5, 64, 64]
-
-        feat_map = self.proj(self.stage2(self.stage1(x_in))) # [B, d_model, 16, 16]
-        vis_tokens = feat_map.flatten(2).permute(0, 2, 1)    # [B, 256, d_model]
-        return vis_tokens, feat_map
-
-
-# -----------------------------------------------------------------------------
-# 2. SmolVLA Multimodal Cross-Attention Block
-# -----------------------------------------------------------------------------
-class SmolVLAMultimodalBlock(nn.Module):
-    """
-    Multimodal Transformer Layer:
-    - Language Query -> Spatial Visual Patches Cross-Attention
-    - Self-Attention across fused multimodal representations
-    """
+class MultimodalCrossAttentionBlock(nn.Module):
     def __init__(self, d_model=128, nhead=4, d_ff=256):
         super().__init__()
         self.norm_cross_txt = nn.LayerNorm(d_model)
         self.norm_cross_vis = nn.LayerNorm(d_model)
         self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
-
+        
         self.norm_self = nn.LayerNorm(d_model)
         self.self_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
-
+        
         self.norm_ffn = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ff),
@@ -92,58 +80,52 @@ class SmolVLAMultimodalBlock(nn.Module):
         )
 
     def forward(self, text_tokens, visual_patches):
-        # 1. Cross-Attention: Language Query attends to Visual Patches
+        # 1. Cross-attention: Language attends to vision
         q = self.norm_cross_txt(text_tokens)
         kv = self.norm_cross_vis(visual_patches)
-        cross_out, cross_weights = self.cross_attn(q, kv, kv, need_weights=True)
+        cross_out, weights = self.cross_attn(q, kv, kv, need_weights=True)
         text_tokens = text_tokens + cross_out
-
-        # 2. Joint Self-Attention over sequence
-        joint_seq = torch.cat([text_tokens, visual_patches], dim=1)
-        norm_joint = self.norm_self(joint_seq)
-        joint_out, _ = self.self_attn(norm_joint, norm_joint, norm_joint)
-        joint_seq = joint_seq + joint_out
-
-        # 3. Feed Forward
-        joint_seq = joint_seq + self.ffn(self.norm_ffn(joint_seq))
-
+        
+        # 2. Joint multimodal self-attention
+        joint = torch.cat([text_tokens, visual_patches], dim=1)
+        joint_norm = self.norm_self(joint)
+        sa_out, _ = self.self_attn(joint_norm, joint_norm, joint_norm)
+        joint = joint + sa_out
+        
+        # 3. FFN
+        joint = joint + self.ffn(self.norm_ffn(joint))
+        
         T = text_tokens.size(1)
-        new_text = joint_seq[:, :T]
-        new_vis = joint_seq[:, T:]
-        return new_text, new_vis, cross_weights
+        return joint[:, :T], joint[:, T:], weights
 
-
-# -----------------------------------------------------------------------------
-# 3. Complete Spatially Grounded SmolVLA Backbone
-# -----------------------------------------------------------------------------
 class SmolVLABackbone(nn.Module):
     """
-    Spatially Grounded SmolVLA Multimodal Backbone:
-    - CoordConv Spatial Feature Pyramidal Encoder (256 tokens)
-    - Subword Language Tokenizer & Positional Embeddings (16 tokens)
-    - Multi-Head Language-Visual Cross-Attention Fusion
-    - Differentiable Spatial Soft-Argmax for exact 2D Target Grounding
+    Pretrained VLM-backed SmolVLA Backbone:
+    - Genuine pretrained ViT-B/32 encoder (49 patches + 77 BPE tokens)
+    - Projections from 512 -> d_model (128)
+    - Multimodal Transformer fusion layers
+    - Differentiable soft-argmax grounded 2D target estimation from token-patch cross attention
     """
-    def __init__(self, vocab_size=32, d_model=128, text_len=16, nhead=4, num_layers=2):
+    def __init__(self, d_model=128, vlm_dim=512, nhead=4, num_layers=2, device='cpu'):
         super().__init__()
         self.d_model = d_model
-        self.text_len = text_len
-
-        # Language Stream
-        self.token_embed = nn.Embedding(vocab_size, d_model)
-        self.text_pos_embed = nn.Parameter(torch.randn(1, text_len, d_model) * 0.02)
-
-        # Spatial Grounded Vision Stream
-        self.visual_encoder = SpatialGroundedVisualEncoder(in_channels=3, d_model=d_model)
-
-        # Multimodal Transformer Fusion Layers
+        self.vlm = PretrainedVLMEncoder(device=device)
+        
+        self.vis_proj = nn.Sequential(
+            nn.Linear(vlm_dim, d_model),
+            nn.LayerNorm(d_model)
+        )
+        self.txt_proj = nn.Sequential(
+            nn.Linear(vlm_dim, d_model),
+            nn.LayerNorm(d_model)
+        )
+        
         self.layers = nn.ModuleList([
-            SmolVLAMultimodalBlock(d_model=d_model, nhead=nhead, d_ff=d_model * 2)
+            MultimodalCrossAttentionBlock(d_model=d_model, nhead=nhead, d_ff=d_model * 2)
             for _ in range(num_layers)
         ])
-
-        # Color token queries for spatial object localization
-        self.obj_query_head = nn.Sequential(
+        
+        self.grounding_head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
             nn.GELU(),
@@ -151,30 +133,30 @@ class SmolVLABackbone(nn.Module):
         )
 
     def forward(self, text_ids, img):
-        # 1. Embed text
-        text_feats = self.token_embed(text_ids) + self.text_pos_embed
+        with torch.no_grad():
+            vis_patches, cls_emb = self.vlm.encode_vision(img) # [B, 49, 512]
+            text_feats = self.vlm.encode_text(text_ids)         # [B, 77, 512]
+            
+            # Real zero-shot pretrained similarity heatmap
+            base_weights = torch.einsum('bld,bpd->blp', text_feats, vis_patches) # [B, 77, 49]
+            base_probs = F.softmax(base_weights * 5.0, dim=-1)
 
-        # 2. Spatially grounded visual encoding
-        vis_feats, feat_map = self.visual_encoder(img) # vis: [B, 256, d], feat_map: [B, d, 16, 16]
+        # Project 512 -> 128
+        cur_txt = self.txt_proj(text_feats[:, :16]) # Take top 16 active tokens for fast transformer
+        cur_vis = self.vis_proj(vis_patches)        # [B, 49, 128]
 
-        # 3. Multimodal cross-attention layers
-        cross_weights_history = []
         for layer in self.layers:
-            text_feats, vis_feats, weights = layer(text_feats, vis_feats)
-            cross_weights_history.append(weights)
+            cur_txt, cur_vis, _ = layer(cur_txt, cur_vis)
 
-        # 4. Extract grounded 2D target estimates from multimodal attention
-        # Spatial grounding logits: pooling text representation across visual feature tokens
-        txt_query = self.obj_query_head(text_feats.mean(dim=1)) # [B, d_model]
-        vis_t = vis_feats.transpose(1, 2) # [B, d_model, 256]
-        attn_logits = torch.bmm(txt_query.unsqueeze(1), vis_t) / (self.d_model ** 0.5) # [B, 1, 256]
-        spatial_probs = F.softmax(attn_logits * 4.0, dim=-1) # [B, 1, 256]
-
-        # Soft-Argmax (differentiable target location in [-1, 1] coordinates)
-        grid_x = self.visual_encoder.grid_x.to(img.device)
-        grid_y = self.visual_encoder.grid_y.to(img.device)
-        gx = (spatial_probs * grid_x).sum(dim=-1) # [B, 1]
-        gy = (spatial_probs * grid_y).sum(dim=-1) # [B, 1]
+        # Differentiable soft-argmax 2D coordinate extraction
+        txt_q = self.grounding_head(cur_txt.mean(dim=1)) # [B, 128]
+        attn_logits = torch.bmm(txt_q.unsqueeze(1), cur_vis.transpose(1, 2)) / (self.d_model ** 0.5) # [B, 1, 49]
+        spatial_probs = F.softmax(attn_logits * 4.0, dim=-1)
+        
+        grid_x = self.vlm.grid_x.to(img.device)
+        grid_y = self.vlm.grid_y.to(img.device)
+        gx = (spatial_probs * grid_x).sum(dim=-1)
+        gy = (spatial_probs * grid_y).sum(dim=-1)
         grounded_2d = torch.cat([gx, gy], dim=-1) # [B, 2]
 
-        return text_feats, vis_feats, cross_weights_history[-1], grounded_2d
+        return cur_txt, cur_vis, base_probs, grounded_2d

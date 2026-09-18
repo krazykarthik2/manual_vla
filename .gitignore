@@ -1,0 +1,3 @@
+*.npz
+vlm_features_cache.pt
+*.tmp
