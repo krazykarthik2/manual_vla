@@ -142,9 +142,10 @@ class FullSmolVLAPolicy(nn.Module):
         vlm_tokens = self.vlm_proj(last_hidden.float()) # [B, seq_len, d_action_model]
         return vlm_tokens
 
-    def forward_from_embeddings(self, x_t, t, vlm_tokens, proprio=None):
+    def forward_from_embeddings(self, x_t, t, vlm_tokens, proprio=None, return_activations=False):
         """
         Action generation conditioned on cached or extracted SmolVLM tokens.
+        If return_activations=True, also returns dict of layer outputs and cross-attention maps.
         """
         B = vlm_tokens.size(0)
 
@@ -160,24 +161,50 @@ class FullSmolVLAPolicy(nn.Module):
         act_queries = self.action_in_proj(x_t) + self.pos_queries
 
         # Layer 1
-        sa_out, _ = self.dec_sa1(act_queries, act_queries, act_queries)
+        sa_out, sa_w1 = self.dec_sa1(act_queries, act_queries, act_queries, need_weights=return_activations)
         act_queries = self.dec_n1(act_queries + sa_out)
-        ca_out, _ = self.dec_ca1(act_queries, context, context)
+        l1_sa = act_queries
+
+        ca_out, ca_w1 = self.dec_ca1(act_queries, context, context, need_weights=True)
         act_queries = self.dec_n2(act_queries + ca_out)
+        l1_ca = act_queries
+
         act_queries = self.dec_n3(act_queries + self.dec_ffn1(act_queries))
+        l1_out = act_queries
 
         # Layer 2
-        sa_out2, _ = self.dec_sa2(act_queries, act_queries, act_queries)
+        sa_out2, sa_w2 = self.dec_sa2(act_queries, act_queries, act_queries, need_weights=return_activations)
         act_queries = self.dec_n4(act_queries + sa_out2)
-        ca_out2, _ = self.dec_ca2(act_queries, context, context)
+        l2_sa = act_queries
+
+        ca_out2, ca_w2 = self.dec_ca2(act_queries, context, context, need_weights=True)
         act_queries = self.dec_n5(act_queries + ca_out2)
+        l2_ca = act_queries
+
         act_queries = self.dec_n6(act_queries + self.dec_ffn2(act_queries))
+        l2_out = act_queries
 
         v_pred = self.out_head(act_queries)
+
+        if return_activations:
+            activations = {
+                "context": context,              # [B, 2+seq_len, d_model]
+                "l1_sa": l1_sa,                  # [B, horizon, d_model]
+                "l1_ca": l1_ca,                  # [B, horizon, d_model]
+                "l1_out": l1_out,                # [B, horizon, d_model]
+                "ca_w1": ca_w1,                  # [B, horizon, context_len]
+                "l2_sa": l2_sa,                  # [B, horizon, d_model]
+                "l2_ca": l2_ca,                  # [B, horizon, d_model]
+                "l2_out": l2_out,                # [B, horizon, d_model]
+                "ca_w2": ca_w2,                  # [B, horizon, context_len]
+                "v_pred": v_pred                 # [B, horizon, action_dim]
+            }
+            return v_pred, activations
+
         return v_pred
 
     @torch.no_grad()
-    def sample(self, images_pil, prompt_texts, proprio=None, num_steps=15):
+    def sample(self, images_pil, prompt_texts, proprio=None, num_steps=15, return_activations=False):
         B = len(images_pil)
         vlm_tokens = self.extract_smolvlm_context(images_pil, prompt_texts)
 
@@ -186,10 +213,15 @@ class FullSmolVLAPolicy(nn.Module):
 
         x = torch.randn(B, self.horizon, self.action_dim, device=self.device)
         dt = 1.0 / num_steps
+        last_acts = None
 
         for i in range(num_steps):
             t = torch.full((B,), (i + 0.5) * dt, device=self.device)
-            v = self.forward_from_embeddings(x, t, vlm_tokens, proprio=proprio)
+            need_act = return_activations and (i == num_steps - 1)
+            if need_act:
+                v, last_acts = self.forward_from_embeddings(x, t, vlm_tokens, proprio=proprio, return_activations=True)
+            else:
+                v = self.forward_from_embeddings(x, t, vlm_tokens, proprio=proprio, return_activations=False)
             x = x + v * dt
 
         raw_x = x * ACTION_STD + ACTION_MEAN
@@ -197,4 +229,8 @@ class FullSmolVLAPolicy(nn.Module):
         raw_perm = raw_x.permute(0, 2, 1).reshape(B * self.action_dim, 1, self.horizon)
         smoothed = F.conv1d(raw_perm, kernel, padding=2)
         smoothed = smoothed.view(B, self.action_dim, self.horizon).permute(0, 2, 1)
+
+        if return_activations:
+            return smoothed, last_acts, vlm_tokens
+
         return smoothed
