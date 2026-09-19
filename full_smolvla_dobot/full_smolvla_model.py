@@ -34,29 +34,33 @@ class FullSmolVLAPolicy(nn.Module):
     - Continuous Sinusoidal Diffusion Time + Proprioception Conditioning
     - Multimodal Cross-Attention Action Decoder Head over Horizon H=128 for 4D actions (x, y, z, grip)
     """
-    def __init__(self, d_action_model=128, horizon=128, action_dim=4, freeze_backbone=True, device='cpu'):
+    def __init__(self, d_action_model=128, horizon=128, action_dim=4, freeze_backbone=True, load_backbone=True, smolvlm_hidden_dim=576, device='cpu'):
         super().__init__()
         self.horizon = horizon
         self.action_dim = action_dim
         self.d_model = d_action_model
         self.device = device
+        self.processor = None
+        self.smolvlm = None
 
-        print(f"[FullSmolVLA] Initializing genuine SmolVLM foundation backbone ({MODEL_NAME})...", flush=True)
-        self.processor = AutoProcessor.from_pretrained(MODEL_NAME)
-        self.smolvlm = SmolVLMForConditionalGeneration.from_pretrained(
-            MODEL_NAME,
-            torch_dtype=torch.float32,
-            low_cpu_mem_usage=True
-        ).to(device)
+        if load_backbone:
+            print(f"[FullSmolVLA] Initializing genuine SmolVLM foundation backbone ({MODEL_NAME})...", flush=True)
+            self.processor = AutoProcessor.from_pretrained(MODEL_NAME)
+            self.smolvlm = SmolVLMForConditionalGeneration.from_pretrained(
+                MODEL_NAME,
+                torch_dtype=torch.float32,
+                low_cpu_mem_usage=True
+            ).to(device)
 
-        if freeze_backbone:
-            print("[FullSmolVLA] Freezing pretrained SmolVLM weights (training Action Expert Cross-Attention Head)...", flush=True)
-            for p in self.smolvlm.parameters():
-                p.requires_grad = False
-            self.smolvlm.eval()
+            if freeze_backbone:
+                print("[FullSmolVLA] Freezing pretrained SmolVLM weights (training Action Expert Cross-Attention Head)...", flush=True)
+                for p in self.smolvlm.parameters():
+                    p.requires_grad = False
+                self.smolvlm.eval()
 
-        # SmolVLM text config hidden dimension
-        smolvlm_hidden_dim = getattr(self.smolvlm.config.text_config, "hidden_size", 576)
+            # SmolVLM text config hidden dimension
+            smolvlm_hidden_dim = getattr(self.smolvlm.config.text_config, "hidden_size", smolvlm_hidden_dim)
+
         self.vlm_proj = nn.Sequential(
             nn.Linear(smolvlm_hidden_dim, d_action_model),
             nn.LayerNorm(d_action_model)

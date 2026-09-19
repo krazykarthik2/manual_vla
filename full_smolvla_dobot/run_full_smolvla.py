@@ -16,7 +16,7 @@ def run_full_smolvla(fast_mode=False):
     device = DEVICE
     model_path = os.path.join(MODEL_DIR, "dobot_full_smolvla_policy.pth")
 
-    model = FullSmolVLAPolicy(d_action_model=128, num_layers=2, device=device).to(device)
+    model = FullSmolVLAPolicy(d_action_model=128, device=device).to(device)
     if not os.path.exists(model_path):
         print("\n" + "=" * 68, flush=True)
         print(f"[ERROR] No trained Full SmolVLA checkpoint found at: {model_path}", flush=True)

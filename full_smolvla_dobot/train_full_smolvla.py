@@ -139,8 +139,8 @@ def train(epochs=150, batch_size=16, lr=1.5e-3):
     dataset = FastFullSmolVLADataset(DATA_DIR)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=pad_collate_fn)
 
-    # Instantiate FullSmolVLAPolicy without loading heavy LLM in memory during train if cache is ready
-    policy = FullSmolVLAPolicy(d_action_model=128, device=DEVICE).to(DEVICE)
+    # Instantiate FullSmolVLAPolicy without loading heavy LLM into memory during training since features are cached
+    policy = FullSmolVLAPolicy(d_action_model=128, load_backbone=False, device=DEVICE).to(DEVICE)
     policy.train()
 
     trainable_params = [p for p in policy.parameters() if p.requires_grad]
