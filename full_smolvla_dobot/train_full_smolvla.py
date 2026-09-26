@@ -64,7 +64,7 @@ class FastFullSmolVLADataset(Dataset):
                 run_auto_demonstrator(num_demos=100)
                 files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
 
-            policy = FullSmolVLAPolicy(d_action_model=128, device=DEVICE)
+            policy = FullSmolVLAPolicy(d_action_model=128, device=DEVICE).to(DEVICE)
             cached_vlm_tokens = []
             print(f">> Caching SmolVLM multimodal tokens for {len(files)} demonstrations...", flush=True)
 
