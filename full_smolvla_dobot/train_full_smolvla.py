@@ -22,7 +22,6 @@ if DEVICE.type == "cpu":
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "demonstrations")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
-CACHE_FILE = os.path.join(os.path.dirname(__file__), "data", "full_smolvlm_features_cache.pt")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 def safe_save_model(state_dict, path):
@@ -53,61 +52,37 @@ def safe_save_model(state_dict, path):
 ACTION_MEAN = torch.tensor([0.2028, 0.0008, 0.0854, 0.5360], dtype=torch.float32)
 ACTION_STD  = torch.tensor([0.0330, 0.0837, 0.0362, 0.4987], dtype=torch.float32)
 
-class FastFullSmolVLADataset(Dataset):
-    def __init__(self, data_dir, cache_file=CACHE_FILE):
-        if not os.path.exists(cache_file):
-            print(f">> Cache file {cache_file} not found. Generating cache with SmolVLM backbone on {DEVICE}...", flush=True)
+class DirectFullSmolVLADataset(Dataset):
+    """
+    Direct on-the-fly dataset without disk feature caching.
+    Loads RGB images, instructions, proprioception, and normalized trajectories directly from clean demonstrations.
+    """
+    def __init__(self, data_dir):
+        files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
+        if not files:
+            print(">> No demonstrations found. Auto-generating 100 clean demonstrations...", flush=True)
+            from auto_generate_demos import run_auto_demonstrator
+            run_auto_demonstrator(num_demos=100)
             files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
-            if not files:
-                print(">> No demonstrations found. Auto-generating 100 clean demonstrations...", flush=True)
-                from auto_generate_demos import run_auto_demonstrator
-                run_auto_demonstrator(num_demos=100)
-                files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
-
-            policy = FullSmolVLAPolicy(d_action_model=128, device=DEVICE).to(DEVICE)
-            cached_vlm_tokens = []
-            print(f">> Caching SmolVLM multimodal tokens for {len(files)} demonstrations...", flush=True)
-
-            for f in tqdm(files, desc="SmolVLM Caching"):
-                d = np.load(f, allow_pickle=True)
-                img_chw = d['images'][0] # [3, 64, 64] float in [0, 1]
-                img_hwc = (np.transpose(img_chw, (1, 2, 0)) * 255).astype(np.uint8)
-                pil_img = Image.fromarray(img_hwc)
-                prompt_str = str(d['prompt'][0])
-
-                with torch.no_grad():
-                    vlm_tokens = policy.extract_smolvlm_context([pil_img], [prompt_str]) # [1, seq_len, 128]
-                cached_vlm_tokens.append(vlm_tokens[0].float().cpu())
-
-            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-            torch.save({
-                'files': files,
-                'vlm_tokens': cached_vlm_tokens
-            }, cache_file)
-            print(f">> Saved SmolVLM cache -> {cache_file}", flush=True)
-
-        print(f">> Loading Pretrained SmolVLM features from {cache_file}...", flush=True)
-        cache = torch.load(cache_file, map_location="cpu")
-        files = cache['files']
-        cached_tokens = cache['vlm_tokens']
 
         self.samples = []
-        for idx, f in enumerate(files):
+        for f in files:
             d = np.load(f, allow_pickle=True)
+            img_chw = d['images'][0] # [3, 64, 64] float in [0, 1]
+            img_hwc = (np.transpose(img_chw, (1, 2, 0)) * 255).astype(np.uint8)
+            pil_img = Image.fromarray(img_hwc)
+            prompt_str = str(d['prompt'][0])
+
             proprio = d['proprioception'].astype(np.float32)
             acts = d['actions'].astype(np.float32)
 
             raw_traj = np.concatenate([proprio[:, :3], acts[:, 4:5]], axis=-1)
             norm_traj = (torch.tensor(raw_traj, dtype=torch.float32) - ACTION_MEAN) / (ACTION_STD + 1e-6)
-            proprio0 = proprio[0]
+            proprio0 = torch.tensor(proprio[0], dtype=torch.float32)
 
-            self.samples.append((
-                cached_tokens[idx],
-                torch.tensor(proprio0, dtype=torch.float32),
-                norm_traj
-            ))
+            self.samples.append((pil_img, prompt_str, proprio0, norm_traj))
 
-        print(f">> Loaded {len(self.samples)} cached demonstration trajectories with SmolVLM backbone.", flush=True)
+        print(f">> Loaded {len(self.samples)} direct demonstrations (no disk caching).", flush=True)
 
     def __len__(self):
         return len(self.samples)
@@ -115,32 +90,27 @@ class FastFullSmolVLADataset(Dataset):
     def __getitem__(self, idx):
         return self.samples[idx]
 
-def pad_collate_fn(batch):
-    tokens_list, proprio_list, traj_list = zip(*batch)
-    max_len = max(t.size(0) for t in tokens_list)
-    d_model = tokens_list[0].size(1)
+def direct_collate_fn(batch):
+    images, prompts, proprios, trajs = zip(*batch)
+    proprios = torch.stack(proprios)
+    trajs = torch.stack(trajs)
+    return list(images), list(prompts), proprios, trajs
 
-    padded_tokens = torch.zeros(len(tokens_list), max_len, d_model, dtype=torch.float32)
-    for i, t in enumerate(tokens_list):
-        padded_tokens[i, :t.size(0)] = t
-
-    proprios = torch.stack(proprio_list)
-    trajs = torch.stack(traj_list)
-    return padded_tokens, proprios, trajs
-
-def train(epochs=150, batch_size=16, lr=1.5e-3):
+def train(epochs=150, batch_size=8, lr=1.5e-3):
     print("=" * 70, flush=True)
     print("   Full SmolVLA Policy with Real Hugging Face SmolVLM Backbone", flush=True)
-    print("   - Backbone: HuggingFaceTB/SmolVLM-256M-Instruct", flush=True)
+    print("   - Backbone: HuggingFaceTB/SmolVLM-256M-Instruct (Frozen Pretrained Weights)", flush=True)
+    print("   - Architecture: 3B (Multi-Layer Intermediate Feature Fusion: Layers 10, 20, 30)", flush=True)
+    print("   - Feature Pipeline: Direct On-The-Fly Batch Execution (Zero Disk Caching)", flush=True)
     print("   - Multimodal Action Expert (Cross-Attention Action Decoder Head)", flush=True)
     print(f"   - Hardware Compute Engine: {DEVICE}", flush=True)
     print("=" * 70, flush=True)
 
-    dataset = FastFullSmolVLADataset(DATA_DIR)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=pad_collate_fn)
+    dataset = DirectFullSmolVLADataset(DATA_DIR)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=direct_collate_fn)
 
-    # Instantiate FullSmolVLAPolicy without loading heavy LLM into memory during training since features are cached
-    policy = FullSmolVLAPolicy(d_action_model=128, load_backbone=False, device=DEVICE).to(DEVICE)
+    # Initialize Policy with real SmolVLM backbone loaded
+    policy = FullSmolVLAPolicy(d_action_model=128, load_backbone=True, freeze_backbone=True, device=DEVICE).to(DEVICE)
     policy.train()
 
     trainable_params = [p for p in policy.parameters() if p.requires_grad]
@@ -153,19 +123,21 @@ def train(epochs=150, batch_size=16, lr=1.5e-3):
     model_path = os.path.join(MODEL_DIR, "dobot_full_smolvla_policy.pth")
     best_loss = float("inf")
 
-    print(f"\n>> Training Full SmolVLA Policy across {len(dataset)} demonstrations ({epochs} epochs)...", flush=True)
+    print(f"\n>> Training Full SmolVLA Policy directly across {len(dataset)} demonstrations ({epochs} epochs)...", flush=True)
     epoch_pbar = tqdm(range(1, epochs + 1), desc="Training Full SmolVLA")
 
     try:
         for epoch in epoch_pbar:
             total_loss = 0.0
-            for vlm_tokens, proprio, x_1 in dataloader:
-                vlm_tokens = vlm_tokens.to(DEVICE)
+            for images, prompts, proprio, x_1 in dataloader:
                 proprio = proprio.to(DEVICE)
                 x_1 = x_1.to(DEVICE)
+                B = len(images)
 
-                B = vlm_tokens.size(0)
                 optimizer.zero_grad(set_to_none=True)
+
+                # Extract Architecture 3B multi-layer features on the fly
+                vlm_tokens = policy.extract_smolvlm_context(images, prompts)
 
                 x_0 = torch.randn_like(x_1)
                 t = torch.rand(B, device=DEVICE)
@@ -190,7 +162,7 @@ def train(epochs=150, batch_size=16, lr=1.5e-3):
 
             if avg_loss < best_loss or epoch % 10 == 0:
                 best_loss = min(best_loss, avg_loss)
-                # Only save trainable action expert parameters, not frozen SmolVLM backbone
+                # Save trainable action expert parameters
                 filtered = {k: v for k, v in policy.state_dict().items() if not k.startswith("smolvlm.")}
                 safe_save_model(filtered, model_path)
 
@@ -212,5 +184,14 @@ def train(epochs=150, batch_size=16, lr=1.5e-3):
     print(f"\n[SUCCESS] Full SmolVLA Checkpoint saved -> {model_path}", flush=True)
 
 if __name__ == "__main__":
-    epochs = int(sys.argv[1]) if len(sys.argv) > 1 else 150
-    train(epochs=epochs)
+    import argparse
+    parser = argparse.ArgumentParser(description="Train Full SmolVLA Policy directly on-the-fly (Zero Disk Caching)")
+    parser.add_argument("--epochs", type=int, default=150, help="Number of training epochs (default: 150)")
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size (default: 8)")
+    parser.add_argument("--lr", type=float, default=1.5e-3, help="Learning rate (default: 1.5e-3)")
+    args, unknown = parser.parse_known_args()
+
+    if len(unknown) > 0 and unknown[0].isdigit():
+        args.epochs = int(unknown[0])
+
+    train(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
