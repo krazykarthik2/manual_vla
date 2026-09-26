@@ -27,6 +27,75 @@ CACHE_FILE = os.path.join(os.path.dirname(__file__), "data", "full_smolvlm_arch3
 CACHE_VERSION = "v3_arch3b_multi_layer"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
+def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, user_workers_per_gpu=None):
+    """
+    Intelligently auto-adjusts batch sizes, num_workers, and workers_per_gpu
+    based on available GPUs, VRAM per GPU, and CPU core count.
+    """
+    cpu_cores = os.cpu_count() or 4
+    num_gpus = torch.cuda.device_count()
+
+    if num_gpus > 0:
+        try:
+            total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            gpu_name = torch.cuda.get_device_name(0)
+        except Exception:
+            total_vram_gb = 16.0
+            gpu_name = "CUDA GPU"
+
+        # Auto workers per GPU
+        if user_workers_per_gpu is not None and user_workers_per_gpu > 0:
+            workers_per_gpu = user_workers_per_gpu
+        else:
+            if total_vram_gb >= 38:  # e.g. L40S (48GB), A100 (40/80GB), H100 (80GB)
+                workers_per_gpu = min(4, max(1, cpu_cores // num_gpus))
+            elif total_vram_gb >= 20:  # e.g. RTX 3090/4090, A5000 (24GB)
+                workers_per_gpu = min(2, max(1, cpu_cores // num_gpus))
+            else:  # e.g. T4 (16GB), RTX 3080/4070 (10-12GB)
+                workers_per_gpu = 1
+
+        # Auto total workers
+        if user_num_workers is not None and user_num_workers > 0:
+            num_workers = user_num_workers
+        else:
+            num_workers = num_gpus * workers_per_gpu
+
+        # Auto training batch size
+        if user_batch_size is not None and user_batch_size > 0:
+            batch_size = user_batch_size
+        else:
+            if total_vram_gb >= 38:
+                batch_size = 64
+            elif total_vram_gb >= 20:
+                batch_size = 32
+            else:
+                batch_size = 16
+
+        cache_batch_size = 64 if total_vram_gb >= 38 else (32 if total_vram_gb >= 20 else 16)
+
+        hw_summary = (
+            f"Hardware: {num_gpus}x {gpu_name} ({total_vram_gb:.1f} GB VRAM each) | {cpu_cores} CPU cores\n"
+            f">> Auto-Adjusted: workers_per_gpu={workers_per_gpu}, total_workers={num_workers}, "
+            f"cache_batch_size={cache_batch_size}, train_batch_size={batch_size}"
+        )
+    else:
+        num_workers = user_num_workers if (user_num_workers and user_num_workers > 0) else min(4, max(1, cpu_cores // 2))
+        workers_per_gpu = 1
+        batch_size = user_batch_size if (user_batch_size and user_batch_size > 0) else 16
+        cache_batch_size = 8
+        hw_summary = (
+            f"Hardware: CPU environment ({cpu_cores} cores)\n"
+            f">> Auto-Adjusted: CPU workers={num_workers}, cache_batch_size={cache_batch_size}, train_batch_size={batch_size}"
+        )
+
+    return {
+        "num_workers": num_workers,
+        "workers_per_gpu": workers_per_gpu,
+        "batch_size": batch_size,
+        "cache_batch_size": cache_batch_size,
+        "hw_summary": hw_summary
+    }
+
 def safe_save_model(state_dict, path):
     tmp_path = path + ".tmp"
     for attempt in range(5):
@@ -96,20 +165,21 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, out_dict
         print(f"[ERROR in Worker {worker_id} on {target_device}]: {e}\n{traceback.format_exc()}", flush=True)
         out_dict[worker_id] = []
 
-def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=2, cache_batch_size=32):
+def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=None, cache_batch_size=None):
     """
-    Parallel multi-process feature precomputation across multiple GPUs and multiple workers per GPU.
+    Parallel multi-process feature precomputation with auto-hardware scaling across GPUs and CPU workers.
     """
     num_demos = len(files)
     num_gpus = torch.cuda.device_count()
 
-    if num_workers is None:
-        if num_gpus > 0:
-            num_workers = num_gpus * workers_per_gpu
-        else:
-            num_workers = min(4, os.cpu_count() or 2)
+    hw = auto_detect_hardware_config(
+        user_num_workers=num_workers,
+        user_workers_per_gpu=workers_per_gpu
+    )
+    num_workers = hw["num_workers"]
+    workers_per_gpu = hw["workers_per_gpu"]
+    cache_batch_size = cache_batch_size or hw["cache_batch_size"]
 
-    # Shard demonstrations across workers
     indexed_files = list(enumerate(files))
     shards = [indexed_files[i::num_workers] for i in range(num_workers)]
     
@@ -123,7 +193,7 @@ def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=2,
         gpu_id = (w % num_gpus) if num_gpus > 0 else None
         gpu_assignments.append(gpu_id)
 
-    dev_desc = f"{num_gpus} GPU(s) ({workers_per_gpu} workers/GPU -> {num_workers} parallel workers)" if num_gpus > 0 else f"{num_workers} CPU workers"
+    dev_desc = f"{num_gpus} GPU(s) ({workers_per_gpu} workers/GPU -> {num_workers} parallel workers, batch_size={cache_batch_size})" if num_gpus > 0 else f"{num_workers} CPU workers"
     print(f">> Launching parallel SmolVLM feature precomputation across {dev_desc} for {num_demos} demonstrations...", flush=True)
 
     processes = []
@@ -144,7 +214,6 @@ def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=2,
             pbar.update(n)
             done_count += n
         except Exception:
-            # Check if all processes are still alive
             if all(not p.is_alive() for p in processes):
                 break
     pbar.close()
@@ -174,9 +243,9 @@ def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=2,
 
 class FastFullSmolVLADataset(Dataset):
     """
-    High-Performance Dataset with Multi-GPU / Multi-Worker Parallel Pre-Computed Features.
+    High-Performance Dataset with Auto-Tuned Multi-GPU / Multi-Worker Parallel Pre-Computed Features.
     """
-    def __init__(self, data_dir, cache_file=CACHE_FILE, force_recache=False, num_workers=None, workers_per_gpu=2, cache_batch_size=32):
+    def __init__(self, data_dir, cache_file=CACHE_FILE, force_recache=False, num_workers=None, workers_per_gpu=None, cache_batch_size=None):
         valid_cache = False
         if os.path.exists(cache_file) and not force_recache:
             try:
@@ -253,14 +322,23 @@ def pad_collate_fn(batch):
     trajs = torch.stack(traj_list)
     return padded_raw, proprios, trajs
 
-def train(epochs=200, batch_size=32, lr=1.5e-3, force_recache=False, num_workers=None, workers_per_gpu=2):
+def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_workers=None, workers_per_gpu=None):
+    # Auto-detect hardware profile and adjust defaults
+    hw = auto_detect_hardware_config(
+        user_batch_size=batch_size,
+        user_num_workers=num_workers,
+        user_workers_per_gpu=workers_per_gpu
+    )
+    batch_size = hw["batch_size"]
+    num_workers = hw["num_workers"]
+    workers_per_gpu = hw["workers_per_gpu"]
+
     print("=" * 70, flush=True)
     print("   Full SmolVLA Policy with Real Hugging Face SmolVLM Backbone", flush=True)
     print("   - Backbone: HuggingFaceTB/SmolVLM-256M-Instruct", flush=True)
     print("   - Architecture: 3B (Multi-Layer Intermediate Feature Fusion: Layers 10, 20, 30)", flush=True)
-    print("   - Parallelism: Multi-GPU / Multi-Worker Parallel Feature Precomputation", flush=True)
-    print("   - Multimodal Action Expert (Cross-Attention Action Decoder Head)", flush=True)
-    print(f"   - Hardware Compute Engine: {DEVICE}", flush=True)
+    print("   - Parallelism: Auto-Tuned Multi-GPU / Multi-Worker Feature Precomputation", flush=True)
+    print(f"   - {hw['hw_summary']}", flush=True)
     print("=" * 70, flush=True)
 
     dataset = FastFullSmolVLADataset(
@@ -268,7 +346,7 @@ def train(epochs=200, batch_size=32, lr=1.5e-3, force_recache=False, num_workers
         force_recache=force_recache,
         num_workers=num_workers,
         workers_per_gpu=workers_per_gpu,
-        cache_batch_size=32 if DEVICE.type == "cuda" else 8
+        cache_batch_size=hw["cache_batch_size"]
     )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=pad_collate_fn)
 
@@ -346,13 +424,13 @@ def train(epochs=200, batch_size=32, lr=1.5e-3, force_recache=False, num_workers
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     import argparse
-    parser = argparse.ArgumentParser(description="Multi-GPU / Multi-Worker Parallel Pre-computation and Training for Full SmolVLA")
+    parser = argparse.ArgumentParser(description="Auto-Tuned Multi-GPU / Multi-Worker Parallel Training for Full SmolVLA")
     parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs (default: 200)")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for Action Expert training (default: 32)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: auto-detected based on GPU VRAM)")
     parser.add_argument("--lr", type=float, default=1.5e-3, help="Learning rate (default: 1.5e-3)")
     parser.add_argument("--recache", action="store_true", help="Force re-compute the SmolVLM multi-layer features")
-    parser.add_argument("--num-workers", type=int, default=None, help="Total number of parallel caching workers")
-    parser.add_argument("--workers-per-gpu", type=int, default=2, help="Number of parallel workers per GPU (default: 2)")
+    parser.add_argument("--num-workers", type=int, default=None, help="Total caching workers (default: auto-detected)")
+    parser.add_argument("--workers-per-gpu", type=int, default=None, help="Workers per GPU (default: auto-detected)")
     args, unknown = parser.parse_known_args()
 
     if len(unknown) > 0 and unknown[0].isdigit():
