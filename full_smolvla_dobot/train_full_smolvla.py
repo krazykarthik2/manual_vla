@@ -36,8 +36,10 @@ if DEVICE.type == "cpu":
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "demonstrations")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 CACHE_FILE = os.path.join(os.path.dirname(__file__), "data", "full_smolvlm_arch3b_features_cache.pt")
+SHARDS_DIR = os.path.join(os.path.dirname(__file__), "data", "smolvlm_cache_shards")
 CACHE_VERSION = "v3_arch3b_multi_layer"
 os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(SHARDS_DIR, exist_ok=True)
 
 def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, user_workers_per_gpu=None):
     """
@@ -55,22 +57,20 @@ def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, use
             total_vram_gb = 16.0
             gpu_name = "CUDA GPU"
 
-        # Auto workers per GPU: 1 dedicated worker per GPU is cleanest & fastest without VRAM contention
+        # 1 dedicated worker per GPU is cleanest & fastest without VRAM contention
         if user_workers_per_gpu is not None and user_workers_per_gpu > 0:
             workers_per_gpu = user_workers_per_gpu
         else:
             workers_per_gpu = 1
 
-        # Auto total workers
         if user_num_workers is not None and user_num_workers > 0:
             num_workers = user_num_workers
         else:
             num_workers = num_gpus * workers_per_gpu
 
-        # Safe caching batch size to prevent vision-patch activation spikes
         cache_batch_size = 16
 
-        # Auto training batch size for Action Expert (tiny 712k parameters)
+        # Auto training batch size for Action Expert (712k parameters)
         if user_batch_size is not None and user_batch_size > 0:
             batch_size = user_batch_size
         else:
@@ -127,10 +127,10 @@ def safe_save_model(state_dict, path):
 ACTION_MEAN = torch.tensor([0.2028, 0.0008, 0.0854, 0.5360], dtype=torch.float32)
 ACTION_STD  = torch.tensor([0.0330, 0.0837, 0.0362, 0.4987], dtype=torch.float32)
 
-def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, part_file, progress_queue, status_dict):
+def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, shards_dir, progress_queue, status_dict):
     """
     Dedicated worker process to extract SmolVLM multi-layer features on assigned GPU device.
-    Saves results directly to individual part files on disk to eliminate OS shared-memory file descriptor limits.
+    Saves results incrementally to disk after every single batch to guarantee zero lost progress.
     """
     if gpu_id is not None and torch.cuda.is_available():
         torch.cuda.set_device(gpu_id)
@@ -143,7 +143,6 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, part_fil
 
     try:
         policy = FullSmolVLAPolicy(d_action_model=128, load_backbone=True, device=target_device)
-        results = []
 
         for i in range(0, len(indexed_files), cache_batch_size):
             chunk = indexed_files[i:i + cache_batch_size]
@@ -162,8 +161,15 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, part_fil
             with torch.no_grad():
                 raw_h = policy.extract_smolvlm_context(batch_imgs, batch_prompts, return_raw_hidden=True)
 
+            batch_results = []
             for j, orig_idx in enumerate(orig_indices):
-                results.append((orig_idx, raw_h[j].float().cpu()))
+                batch_results.append((orig_idx, raw_h[j].float().cpu()))
+
+            # Incrementally save batch shard to disk immediately
+            chunk_file = os.path.join(shards_dir, f"shard_{orig_indices[0]:06d}_{orig_indices[-1]:06d}.pt")
+            tmp_chunk_file = chunk_file + ".tmp"
+            torch.save(batch_results, tmp_chunk_file)
+            os.replace(tmp_chunk_file, chunk_file)
 
             progress_queue.put(len(chunk))
 
@@ -174,9 +180,6 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, part_fil
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Save worker shard directly to temporary part file
-        os.makedirs(os.path.dirname(part_file), exist_ok=True)
-        torch.save(results, part_file)
         status_dict[worker_id] = True
 
     except Exception as e:
@@ -184,9 +187,9 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, part_fil
         print(f"[ERROR in Worker {worker_id} on {target_device}]: {e}\n{traceback.format_exc()}", flush=True)
         status_dict[worker_id] = False
 
-def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=None, cache_batch_size=None):
+def run_parallel_caching(files, cache_file, shards_dir=SHARDS_DIR, num_workers=None, workers_per_gpu=None, cache_batch_size=None):
     """
-    Parallel multi-process feature precomputation with auto-hardware scaling across GPUs and CPU workers.
+    Parallel multi-process feature precomputation with incremental disk checkpointing & resume capabilities.
     """
     num_demos = len(files)
     num_gpus = torch.cuda.device_count()
@@ -199,66 +202,85 @@ def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=No
     workers_per_gpu = hw["workers_per_gpu"]
     cache_batch_size = cache_batch_size or hw["cache_batch_size"]
 
-    indexed_files = list(enumerate(files))
-    shards = [indexed_files[i::num_workers] for i in range(num_workers)]
-    
-    ctx = mp.get_context("spawn")
-    manager = ctx.Manager()
-    status_dict = manager.dict()
-    progress_queue = manager.Queue()
+    os.makedirs(shards_dir, exist_ok=True)
 
-    gpu_assignments = []
-    for w in range(num_workers):
-        gpu_id = (w % num_gpus) if num_gpus > 0 else None
-        gpu_assignments.append(gpu_id)
-
-    dev_desc = f"{num_gpus} GPU(s) ({workers_per_gpu} worker/GPU -> {num_workers} parallel workers, batch_size={cache_batch_size})" if num_gpus > 0 else f"{num_workers} CPU workers"
-    print(f">> Launching parallel SmolVLM feature precomputation across {dev_desc} for {num_demos} demonstrations...", flush=True)
-
-    processes = []
-    part_files = []
-    for w in range(num_workers):
-        part_file = f"{cache_file}.part_{w}.pt"
-        part_files.append(part_file)
-        p = ctx.Process(
-            target=_caching_worker,
-            args=(w, gpu_assignments[w], shards[w], cache_batch_size, part_file, progress_queue, status_dict)
-        )
-        p.start()
-        processes.append(p)
-
-    pbar = tqdm(total=num_demos, desc="Parallel SmolVLM Extraction")
-    done_count = 0
-    while done_count < num_demos:
+    # 1. Scan for existing incremental shard files from previous/interrupted runs
+    existing_cached_items = {}
+    existing_shard_files = glob.glob(os.path.join(shards_dir, "shard_*.pt"))
+    for sf in existing_shard_files:
         try:
-            n = progress_queue.get(timeout=1.0)
-            pbar.update(n)
-            done_count += n
+            items = torch.load(sf, map_location="cpu")
+            for orig_idx, tensor in items:
+                existing_cached_items[orig_idx] = tensor
         except Exception:
-            if all(not p.is_alive() for p in processes):
-                break
-    pbar.close()
+            pass
 
-    for p in processes:
-        p.join()
+    # 2. Filter demonstrations that still need extraction
+    indexed_files = list(enumerate(files))
+    missing_indexed_files = [item for item in indexed_files if item[0] not in existing_cached_items]
 
-    # Reassemble shards from individual part files
-    all_results = []
-    for w in range(num_workers):
-        part_file = part_files[w]
-        if os.path.exists(part_file):
+    already_done = len(existing_cached_items)
+    if already_done > 0:
+        print(f">> [RESUME] Found {already_done}/{num_demos} demonstrations already cached on disk! Only extracting remaining {len(missing_indexed_files)} demos...", flush=True)
+
+    if len(missing_indexed_files) > 0:
+        # Shard missing work across workers
+        actual_workers = min(num_workers, len(missing_indexed_files))
+        shards = [missing_indexed_files[i::actual_workers] for i in range(actual_workers)]
+
+        ctx = mp.get_context("spawn")
+        manager = ctx.Manager()
+        status_dict = manager.dict()
+        progress_queue = manager.Queue()
+
+        gpu_assignments = []
+        for w in range(actual_workers):
+            gpu_id = (w % num_gpus) if num_gpus > 0 else None
+            gpu_assignments.append(gpu_id)
+
+        dev_desc = f"{num_gpus} GPU(s) ({workers_per_gpu} worker/GPU -> {actual_workers} parallel workers, batch_size={cache_batch_size})" if num_gpus > 0 else f"{actual_workers} CPU workers"
+        print(f">> Launching parallel SmolVLM extraction across {dev_desc} for {len(missing_indexed_files)} remaining demonstrations...", flush=True)
+
+        processes = []
+        for w in range(actual_workers):
+            p = ctx.Process(
+                target=_caching_worker,
+                args=(w, gpu_assignments[w], shards[w], cache_batch_size, shards_dir, progress_queue, status_dict)
+            )
+            p.start()
+            processes.append(p)
+
+        pbar = tqdm(total=num_demos, initial=already_done, desc="SmolVLM Parallel Extraction (Incremental)")
+        done_count = already_done
+        while done_count < num_demos:
             try:
-                res = torch.load(part_file, map_location="cpu")
-                all_results.extend(res)
-                os.remove(part_file)
-            except Exception as e:
-                print(f"[WARN] Failed to read shard file {part_file}: {e}", flush=True)
+                n = progress_queue.get(timeout=1.0)
+                pbar.update(n)
+                done_count += n
+            except Exception:
+                if all(not p.is_alive() for p in processes):
+                    break
+        pbar.close()
 
-    all_results.sort(key=lambda x: x[0])
-    cached_raw_hidden = [item[1] for item in all_results]
+        for p in processes:
+            p.join()
 
-    if len(cached_raw_hidden) != num_demos:
-        raise RuntimeError(f"Parallel caching gathered {len(cached_raw_hidden)}/{num_demos} items. Some workers may have failed.")
+    # 3. Assemble all shards from disk into unified master cache file
+    all_results = {}
+    final_shard_files = glob.glob(os.path.join(shards_dir, "shard_*.pt"))
+    for sf in final_shard_files:
+        try:
+            items = torch.load(sf, map_location="cpu")
+            for orig_idx, tensor in items:
+                all_results[orig_idx] = tensor
+        except Exception as e:
+            print(f"[WARN] Corrupt shard file {sf}: {e}", flush=True)
+
+    if len(all_results) != num_demos:
+        raise RuntimeError(f"Parallel caching gathered {len(all_results)}/{num_demos} items. Some workers may have failed.")
+
+    # Sort in exact demonstration order
+    cached_raw_hidden = [all_results[i] for i in range(num_demos)]
 
     os.makedirs(os.path.dirname(cache_file), exist_ok=True)
     torch.save({
@@ -266,7 +288,14 @@ def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=No
         'files': files,
         'raw_hidden': cached_raw_hidden
     }, cache_file)
-    print(f">> [DONE] Parallel caching complete. Saved -> {cache_file}", flush=True)
+    print(f">> [DONE] Master SmolVLM cache assembled and saved -> {cache_file}", flush=True)
+
+    # Clean up intermediate shard files
+    for sf in final_shard_files:
+        try:
+            os.remove(sf)
+        except OSError:
+            pass
 
 class FastFullSmolVLADataset(Dataset):
     """
@@ -286,11 +315,17 @@ class FastFullSmolVLADataset(Dataset):
                 print(f">> Cache file corrupted ({e}). Regenerating cache...", flush=True)
 
         if not valid_cache:
-            if os.path.exists(cache_file):
+            if os.path.exists(cache_file) and force_recache:
                 try:
                     os.remove(cache_file)
                 except OSError:
                     pass
+                # Also clean shards if forced recache
+                for sf in glob.glob(os.path.join(SHARDS_DIR, "shard_*.pt")):
+                    try:
+                        os.remove(sf)
+                    except OSError:
+                        pass
 
             files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
             if not files:
@@ -302,6 +337,7 @@ class FastFullSmolVLADataset(Dataset):
             run_parallel_caching(
                 files=files,
                 cache_file=cache_file,
+                shards_dir=SHARDS_DIR,
                 num_workers=num_workers,
                 workers_per_gpu=workers_per_gpu,
                 cache_batch_size=cache_batch_size
@@ -364,6 +400,7 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
     print("   - Backbone: HuggingFaceTB/SmolVLM-256M-Instruct (bfloat16 / float16)", flush=True)
     print("   - Architecture: 3B (Multi-Layer Intermediate Feature Fusion: Layers 10, 20, 30)", flush=True)
     print("   - Parallelism: Auto-Tuned Multi-GPU / Multi-Worker Feature Precomputation", flush=True)
+    print("   - Checkpointing: Incremental Disk Sharding (Zero Progress Lost on Interrupt)", flush=True)
     print(f"   - {hw['hw_summary']}", flush=True)
     print("=" * 70, flush=True)
 
