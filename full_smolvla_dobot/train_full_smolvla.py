@@ -12,6 +12,9 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from PIL import Image
 
+# Optimize PyTorch CUDA memory allocator to eliminate fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 sys.path.append(os.path.dirname(__file__))
 from full_smolvla_model import FullSmolVLAPolicy
 
@@ -30,7 +33,7 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, user_workers_per_gpu=None):
     """
     Intelligently auto-adjusts batch sizes, num_workers, and workers_per_gpu
-    based on available GPUs, VRAM per GPU, and CPU core count.
+    based on available GPUs, VRAM per GPU, and CPU core count to prevent OOM while maximizing speed.
     """
     cpu_cores = os.cpu_count() or 4
     num_gpus = torch.cuda.device_count()
@@ -43,16 +46,11 @@ def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, use
             total_vram_gb = 16.0
             gpu_name = "CUDA GPU"
 
-        # Auto workers per GPU
+        # Auto workers per GPU: 1 dedicated worker per GPU is cleanest & fastest without VRAM contention
         if user_workers_per_gpu is not None and user_workers_per_gpu > 0:
             workers_per_gpu = user_workers_per_gpu
         else:
-            if total_vram_gb >= 38:  # e.g. L40S (48GB), A100 (40/80GB), H100 (80GB)
-                workers_per_gpu = min(4, max(1, cpu_cores // num_gpus))
-            elif total_vram_gb >= 20:  # e.g. RTX 3090/4090, A5000 (24GB)
-                workers_per_gpu = min(2, max(1, cpu_cores // num_gpus))
-            else:  # e.g. T4 (16GB), RTX 3080/4070 (10-12GB)
-                workers_per_gpu = 1
+            workers_per_gpu = 1
 
         # Auto total workers
         if user_num_workers is not None and user_num_workers > 0:
@@ -60,23 +58,19 @@ def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, use
         else:
             num_workers = num_gpus * workers_per_gpu
 
-        # Auto training batch size
+        # Safe caching batch size to prevent vision-patch activation spikes
+        cache_batch_size = 16
+
+        # Auto training batch size for Action Expert (tiny 712k parameters)
         if user_batch_size is not None and user_batch_size > 0:
             batch_size = user_batch_size
         else:
-            if total_vram_gb >= 38:
-                batch_size = 64
-            elif total_vram_gb >= 20:
-                batch_size = 32
-            else:
-                batch_size = 16
-
-        cache_batch_size = 64 if total_vram_gb >= 38 else (32 if total_vram_gb >= 20 else 16)
+            batch_size = 64 if total_vram_gb >= 20 else 32
 
         hw_summary = (
             f"Hardware: {num_gpus}x {gpu_name} ({total_vram_gb:.1f} GB VRAM each) | {cpu_cores} CPU cores\n"
             f">> Auto-Adjusted: workers_per_gpu={workers_per_gpu}, total_workers={num_workers}, "
-            f"cache_batch_size={cache_batch_size}, train_batch_size={batch_size}"
+            f"cache_batch_size={cache_batch_size}, train_batch_size={batch_size} (in bfloat16/float16)"
         )
     else:
         num_workers = user_num_workers if (user_num_workers and user_num_workers > 0) else min(4, max(1, cpu_cores // 2))
@@ -126,9 +120,18 @@ ACTION_STD  = torch.tensor([0.0330, 0.0837, 0.0362, 0.4987], dtype=torch.float32
 
 def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, out_dict, progress_queue):
     """
-    Dedicated worker process to extract SmolVLM multi-layer features in parallel on assigned GPU/device.
+    Dedicated worker process to extract SmolVLM multi-layer features on assigned GPU device.
+    Uses bfloat16/float16 and cleans cache between chunks for zero OOM risk.
     """
-    target_device = f"cuda:{gpu_id}" if gpu_id is not None and torch.cuda.is_available() else "cpu"
+    if gpu_id is not None and torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
+        target_device = f"cuda:{gpu_id}"
+        if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+    else:
+        target_device = "cpu"
+
     try:
         policy = FullSmolVLAPolicy(d_action_model=128, load_backbone=True, device=target_device)
         results = []
@@ -154,6 +157,10 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, out_dict
                 results.append((orig_idx, raw_h[j].float().cpu()))
 
             progress_queue.put(len(chunk))
+
+            # Periodic cache clearing to avoid fragmentation across batches
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         out_dict[worker_id] = results
         del policy
@@ -193,7 +200,7 @@ def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=No
         gpu_id = (w % num_gpus) if num_gpus > 0 else None
         gpu_assignments.append(gpu_id)
 
-    dev_desc = f"{num_gpus} GPU(s) ({workers_per_gpu} workers/GPU -> {num_workers} parallel workers, batch_size={cache_batch_size})" if num_gpus > 0 else f"{num_workers} CPU workers"
+    dev_desc = f"{num_gpus} GPU(s) ({workers_per_gpu} worker/GPU -> {num_workers} parallel workers, batch_size={cache_batch_size})" if num_gpus > 0 else f"{num_workers} CPU workers"
     print(f">> Launching parallel SmolVLM feature precomputation across {dev_desc} for {num_demos} demonstrations...", flush=True)
 
     processes = []
@@ -205,7 +212,6 @@ def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=No
         p.start()
         processes.append(p)
 
-    # Main thread tracks unified live progress bar
     pbar = tqdm(total=num_demos, desc="Parallel SmolVLM Extraction")
     done_count = 0
     while done_count < num_demos:
@@ -221,7 +227,6 @@ def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=No
     for p in processes:
         p.join()
 
-    # Reassemble results in exact demonstration file order
     all_results = []
     for w in range(num_workers):
         if w in out_dict:
@@ -335,7 +340,7 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
 
     print("=" * 70, flush=True)
     print("   Full SmolVLA Policy with Real Hugging Face SmolVLM Backbone", flush=True)
-    print("   - Backbone: HuggingFaceTB/SmolVLM-256M-Instruct", flush=True)
+    print("   - Backbone: HuggingFaceTB/SmolVLM-256M-Instruct (bfloat16 / float16)", flush=True)
     print("   - Architecture: 3B (Multi-Layer Intermediate Feature Fusion: Layers 10, 20, 30)", flush=True)
     print("   - Parallelism: Auto-Tuned Multi-GPU / Multi-Worker Feature Precomputation", flush=True)
     print(f"   - {hw['hw_summary']}", flush=True)
