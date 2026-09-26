@@ -12,6 +12,15 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from PIL import Image
 
+# Try raising file descriptor limits for high-throughput parallel IO
+try:
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target_limit = min(65535, hard) if hard > 0 else 65535
+    resource.setrlimit(resource.RLIMIT_NOFILE, (target_limit, hard))
+except Exception:
+    pass
+
 # Optimize PyTorch CUDA memory allocator to eliminate fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -118,10 +127,10 @@ def safe_save_model(state_dict, path):
 ACTION_MEAN = torch.tensor([0.2028, 0.0008, 0.0854, 0.5360], dtype=torch.float32)
 ACTION_STD  = torch.tensor([0.0330, 0.0837, 0.0362, 0.4987], dtype=torch.float32)
 
-def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, out_dict, progress_queue):
+def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, part_file, progress_queue, status_dict):
     """
     Dedicated worker process to extract SmolVLM multi-layer features on assigned GPU device.
-    Uses bfloat16/float16 and cleans cache between chunks for zero OOM risk.
+    Saves results directly to individual part files on disk to eliminate OS shared-memory file descriptor limits.
     """
     if gpu_id is not None and torch.cuda.is_available():
         torch.cuda.set_device(gpu_id)
@@ -158,19 +167,22 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, out_dict
 
             progress_queue.put(len(chunk))
 
-            # Periodic cache clearing to avoid fragmentation across batches
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        out_dict[worker_id] = results
         del policy
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        # Save worker shard directly to temporary part file
+        os.makedirs(os.path.dirname(part_file), exist_ok=True)
+        torch.save(results, part_file)
+        status_dict[worker_id] = True
+
     except Exception as e:
         import traceback
         print(f"[ERROR in Worker {worker_id} on {target_device}]: {e}\n{traceback.format_exc()}", flush=True)
-        out_dict[worker_id] = []
+        status_dict[worker_id] = False
 
 def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=None, cache_batch_size=None):
     """
@@ -192,7 +204,7 @@ def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=No
     
     ctx = mp.get_context("spawn")
     manager = ctx.Manager()
-    out_dict = manager.dict()
+    status_dict = manager.dict()
     progress_queue = manager.Queue()
 
     gpu_assignments = []
@@ -204,10 +216,13 @@ def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=No
     print(f">> Launching parallel SmolVLM feature precomputation across {dev_desc} for {num_demos} demonstrations...", flush=True)
 
     processes = []
+    part_files = []
     for w in range(num_workers):
+        part_file = f"{cache_file}.part_{w}.pt"
+        part_files.append(part_file)
         p = ctx.Process(
             target=_caching_worker,
-            args=(w, gpu_assignments[w], shards[w], cache_batch_size, out_dict, progress_queue)
+            args=(w, gpu_assignments[w], shards[w], cache_batch_size, part_file, progress_queue, status_dict)
         )
         p.start()
         processes.append(p)
@@ -227,10 +242,17 @@ def run_parallel_caching(files, cache_file, num_workers=None, workers_per_gpu=No
     for p in processes:
         p.join()
 
+    # Reassemble shards from individual part files
     all_results = []
     for w in range(num_workers):
-        if w in out_dict:
-            all_results.extend(out_dict[w])
+        part_file = part_files[w]
+        if os.path.exists(part_file):
+            try:
+                res = torch.load(part_file, map_location="cpu")
+                all_results.extend(res)
+                os.remove(part_file)
+            except Exception as e:
+                print(f"[WARN] Failed to read shard file {part_file}: {e}", flush=True)
 
     all_results.sort(key=lambda x: x[0])
     cached_raw_hidden = [item[1] for item in all_results]
@@ -328,7 +350,6 @@ def pad_collate_fn(batch):
     return padded_raw, proprios, trajs
 
 def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_workers=None, workers_per_gpu=None):
-    # Auto-detect hardware profile and adjust defaults
     hw = auto_detect_hardware_config(
         user_batch_size=batch_size,
         user_num_workers=num_workers,
