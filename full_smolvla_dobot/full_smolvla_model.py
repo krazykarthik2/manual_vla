@@ -43,6 +43,11 @@ class FullSmolVLAPolicy(nn.Module):
         self.processor = None
         self.smolvlm = None
 
+        # Architecture 3B: Multi-layer intermediate feature tapping
+        # Layer 10 (early spatial/edges), Layer 20 (mid relational), Layer 30 (high-level goal semantics)
+        self.selected_layers = (10, 20, 30)
+        num_layers = len(self.selected_layers)
+
         if load_backbone:
             print(f"[FullSmolVLA] Initializing genuine SmolVLM foundation backbone ({MODEL_NAME})...", flush=True)
             self.processor = AutoProcessor.from_pretrained(MODEL_NAME)
@@ -58,11 +63,14 @@ class FullSmolVLAPolicy(nn.Module):
                     p.requires_grad = False
                 self.smolvlm.eval()
 
-            # SmolVLM text config hidden dimension
             smolvlm_hidden_dim = getattr(self.smolvlm.config.text_config, "hidden_size", smolvlm_hidden_dim)
 
+        # Multi-layer intermediate projection (Architecture 3B)
         self.vlm_proj = nn.Sequential(
-            nn.Linear(smolvlm_hidden_dim, d_action_model),
+            nn.Linear(smolvlm_hidden_dim * num_layers, d_action_model),
+            nn.LayerNorm(d_action_model),
+            nn.GELU(),
+            nn.Linear(d_action_model, d_action_model),
             nn.LayerNorm(d_action_model)
         )
 
@@ -112,13 +120,12 @@ class FullSmolVLAPolicy(nn.Module):
             nn.Linear(d_action_model, action_dim)
         )
 
-    def extract_smolvlm_context(self, images_pil, prompt_texts):
+    def extract_smolvlm_context(self, images_pil, prompt_texts, return_raw_hidden=False):
         """
-        Passes images and text prompts through the full SmolVLM backbone
-        and extracts the final layer multimodal representations.
-        Returns: [B, seq_len, d_action_model]
+        Passes images and simplified text prompts through the full SmolVLM backbone.
+        Architecture 3B: Taps intermediate layers (10, 20, 30) for multi-scale spatial + semantic grounding.
         """
-        # Formulate conversation prompts for SmolVLM Instruct format
+        # Simplified prompt format without unnecessary wrappers
         formatted_prompts = []
         for prompt in prompt_texts:
             messages = [
@@ -126,20 +133,24 @@ class FullSmolVLAPolicy(nn.Module):
                     "role": "user",
                     "content": [
                         {"type": "image"},
-                        {"type": "text", "text": f"Instruction: {prompt}. Predict robotic motion."}
+                        {"type": "text", "text": prompt.strip()}
                     ]
                 }
             ]
-            formatted_prompts.append(self.processor.apply_chat_template(messages, add_generation_prompt=True))
+            formatted_prompts.append(self.processor.apply_chat_template(messages, add_generation_prompt=False))
 
         inputs = self.processor(text=formatted_prompts, images=images_pil, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():
             outputs = self.smolvlm(**inputs, output_hidden_states=True)
-            last_hidden = outputs.hidden_states[-1] # [B, seq_len, smolvlm_hidden_dim]
+            # Architecture 3B: Concatenate hidden states from early (10), mid (20), and late (30) layers
+            multi_layer_hidden = torch.cat([outputs.hidden_states[idx].float() for idx in self.selected_layers], dim=-1)
 
-        vlm_tokens = self.vlm_proj(last_hidden.float()) # [B, seq_len, d_action_model]
+        if return_raw_hidden:
+            return multi_layer_hidden
+
+        vlm_tokens = self.vlm_proj(multi_layer_hidden) # [B, seq_len, d_action_model]
         return vlm_tokens
 
     def forward_from_embeddings(self, x_t, t, vlm_tokens, proprio=None, return_activations=False):

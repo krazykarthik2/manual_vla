@@ -53,10 +53,29 @@ def safe_save_model(state_dict, path):
 ACTION_MEAN = torch.tensor([0.2028, 0.0008, 0.0854, 0.5360], dtype=torch.float32)
 ACTION_STD  = torch.tensor([0.0330, 0.0837, 0.0362, 0.4987], dtype=torch.float32)
 
+CACHE_VERSION = "v2_arch3b_multi_layer"
+
 class FastFullSmolVLADataset(Dataset):
-    def __init__(self, data_dir, cache_file=CACHE_FILE):
-        if not os.path.exists(cache_file):
-            print(f">> Cache file {cache_file} not found. Generating cache with SmolVLM backbone on {DEVICE}...", flush=True)
+    def __init__(self, data_dir, cache_file=CACHE_FILE, force_recache=False):
+        valid_cache = False
+        if os.path.exists(cache_file) and not force_recache:
+            try:
+                cache = torch.load(cache_file, map_location="cpu")
+                if isinstance(cache, dict) and cache.get("version") == CACHE_VERSION and "raw_hidden" in cache:
+                    valid_cache = True
+                else:
+                    print(f">> Cache version mismatch or legacy cache found at {cache_file}. Regenerating...", flush=True)
+            except Exception as e:
+                print(f">> Cache file corrupted ({e}). Regenerating...", flush=True)
+
+        if not valid_cache:
+            if os.path.exists(cache_file):
+                try:
+                    os.remove(cache_file)
+                except OSError:
+                    pass
+
+            print(f">> Generating Architecture 3B multi-layer cache with SmolVLM backbone on {DEVICE}...", flush=True)
             files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
             if not files:
                 print(">> No demonstrations found. Auto-generating 100 clean demonstrations...", flush=True)
@@ -64,11 +83,11 @@ class FastFullSmolVLADataset(Dataset):
                 run_auto_demonstrator(num_demos=100)
                 files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
 
-            policy = FullSmolVLAPolicy(d_action_model=128, device=DEVICE)
-            cached_vlm_tokens = []
-            print(f">> Caching SmolVLM multimodal tokens for {len(files)} demonstrations...", flush=True)
+            policy = FullSmolVLAPolicy(d_action_model=128, load_backbone=True, device=DEVICE)
+            cached_raw_hidden = []
+            print(f">> Caching multi-layer intermediate hidden states for {len(files)} demonstrations...", flush=True)
 
-            for f in tqdm(files, desc="SmolVLM Caching"):
+            for f in tqdm(files, desc="SmolVLM Multi-Layer Caching"):
                 d = np.load(f, allow_pickle=True)
                 img_chw = d['images'][0] # [3, 64, 64] float in [0, 1]
                 img_hwc = (np.transpose(img_chw, (1, 2, 0)) * 255).astype(np.uint8)
@@ -76,20 +95,22 @@ class FastFullSmolVLADataset(Dataset):
                 prompt_str = str(d['prompt'][0])
 
                 with torch.no_grad():
-                    vlm_tokens = policy.extract_smolvlm_context([pil_img], [prompt_str]) # [1, seq_len, 128]
-                cached_vlm_tokens.append(vlm_tokens[0].float().cpu())
+                    # Architecture 3B: extract raw multi-layer intermediate hidden states (layers 10, 20, 30)
+                    raw_hidden = policy.extract_smolvlm_context([pil_img], [prompt_str], return_raw_hidden=True)
+                cached_raw_hidden.append(raw_hidden[0].float().cpu())
 
             os.makedirs(os.path.dirname(cache_file), exist_ok=True)
             torch.save({
+                'version': CACHE_VERSION,
                 'files': files,
-                'vlm_tokens': cached_vlm_tokens
+                'raw_hidden': cached_raw_hidden
             }, cache_file)
-            print(f">> Saved SmolVLM cache -> {cache_file}", flush=True)
+            print(f">> Saved Architecture 3B multi-layer cache -> {cache_file}", flush=True)
 
-        print(f">> Loading Pretrained SmolVLM features from {cache_file}...", flush=True)
+        print(f">> Loading Pretrained SmolVLM multi-layer features from {cache_file}...", flush=True)
         cache = torch.load(cache_file, map_location="cpu")
         files = cache['files']
-        cached_tokens = cache['vlm_tokens']
+        cached_raw = cache['raw_hidden']
 
         self.samples = []
         for idx, f in enumerate(files):
@@ -102,7 +123,7 @@ class FastFullSmolVLADataset(Dataset):
             proprio0 = proprio[0]
 
             self.samples.append((
-                cached_tokens[idx],
+                cached_raw[idx],
                 torch.tensor(proprio0, dtype=torch.float32),
                 norm_traj
             ))
@@ -116,27 +137,28 @@ class FastFullSmolVLADataset(Dataset):
         return self.samples[idx]
 
 def pad_collate_fn(batch):
-    tokens_list, proprio_list, traj_list = zip(*batch)
-    max_len = max(t.size(0) for t in tokens_list)
-    d_model = tokens_list[0].size(1)
+    raw_list, proprio_list, traj_list = zip(*batch)
+    max_len = max(t.size(0) for t in raw_list)
+    hidden_dim = raw_list[0].size(1)
 
-    padded_tokens = torch.zeros(len(tokens_list), max_len, d_model, dtype=torch.float32)
-    for i, t in enumerate(tokens_list):
-        padded_tokens[i, :t.size(0)] = t
+    padded_raw = torch.zeros(len(raw_list), max_len, hidden_dim, dtype=torch.float32)
+    for i, t in enumerate(raw_list):
+        padded_raw[i, :t.size(0)] = t
 
     proprios = torch.stack(proprio_list)
     trajs = torch.stack(traj_list)
-    return padded_tokens, proprios, trajs
+    return padded_raw, proprios, trajs
 
-def train(epochs=150, batch_size=16, lr=1.5e-3):
+def train(epochs=150, batch_size=16, lr=1.5e-3, force_recache=False):
     print("=" * 70, flush=True)
     print("   Full SmolVLA Policy with Real Hugging Face SmolVLM Backbone", flush=True)
     print("   - Backbone: HuggingFaceTB/SmolVLM-256M-Instruct", flush=True)
+    print("   - Architecture: 3B (Multi-Layer Intermediate Feature Fusion: Layers 10, 20, 30)", flush=True)
     print("   - Multimodal Action Expert (Cross-Attention Action Decoder Head)", flush=True)
     print(f"   - Hardware Compute Engine: {DEVICE}", flush=True)
     print("=" * 70, flush=True)
 
-    dataset = FastFullSmolVLADataset(DATA_DIR)
+    dataset = FastFullSmolVLADataset(DATA_DIR, force_recache=force_recache)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=pad_collate_fn)
 
     # Instantiate FullSmolVLAPolicy without loading heavy LLM into memory during training since features are cached
@@ -159,13 +181,16 @@ def train(epochs=150, batch_size=16, lr=1.5e-3):
     try:
         for epoch in epoch_pbar:
             total_loss = 0.0
-            for vlm_tokens, proprio, x_1 in dataloader:
-                vlm_tokens = vlm_tokens.to(DEVICE)
+            for raw_hidden, proprio, x_1 in dataloader:
+                raw_hidden = raw_hidden.to(DEVICE)
                 proprio = proprio.to(DEVICE)
                 x_1 = x_1.to(DEVICE)
 
-                B = vlm_tokens.size(0)
+                B = raw_hidden.size(0)
                 optimizer.zero_grad(set_to_none=True)
+
+                # Project multi-layer features into action expert dimension with trainable vlm_proj
+                vlm_tokens = policy.vlm_proj(raw_hidden)
 
                 x_0 = torch.randn_like(x_1)
                 t = torch.rand(B, device=DEVICE)
@@ -212,5 +237,16 @@ def train(epochs=150, batch_size=16, lr=1.5e-3):
     print(f"\n[SUCCESS] Full SmolVLA Checkpoint saved -> {model_path}", flush=True)
 
 if __name__ == "__main__":
-    epochs = int(sys.argv[1]) if len(sys.argv) > 1 else 150
-    train(epochs=epochs)
+    import argparse
+    parser = argparse.ArgumentParser(description="Train Full SmolVLA Policy with Architecture 3B Multi-Layer Features")
+    parser.add_argument("--epochs", type=int, default=150, help="Number of training epochs (default: 150)")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size (default: 16)")
+    parser.add_argument("--lr", type=float, default=1.5e-3, help="Learning rate (default: 1.5e-3)")
+    parser.add_argument("--recache", action="store_true", help="Force regenerate the SmolVLM multi-layer cache")
+    args, unknown = parser.parse_known_args()
+
+    # Support passing epoch as first positional arg for backwards compatibility with .bat scripts
+    if len(unknown) > 0 and unknown[0].isdigit():
+        args.epochs = int(unknown[0])
+
+    train(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, force_recache=args.recache)
