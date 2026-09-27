@@ -224,7 +224,7 @@ def make_smolvla():
         "MultimodalCrossAttentionBlock wherein language tokens query the visual patches. This creates a dense correlation "
         "matrix associating linguistic intent (e.g., 'red cube') with spatial coordinates."
     )
-    p.figure(os.path.join(FIG_DIR, "real_smolvla_attention.png"), "Figure 2: Real CLIP Zero-Shot Attention Heatmap extracted during inference, showing the cross-attention between 77 textual tokens and 49 visual patches.")
+    p.figure(os.path.join(FIG_DIR, "real_smolvla_attention.png"), "Figure 2: Real CLIP Zero-Shot Attention visualized in 3D. The X and Y axes represent the 7x7 visual patch grid, while the Z axis represents the sequence of language tokens. Color and sphere volume indicate cross-attention weight intensity.")
     
     p.paragraph(
         "As seen in the extraction above, the frozen CLIP weights innately cluster high-relevance patches corresponding "

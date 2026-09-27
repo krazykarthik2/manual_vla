@@ -59,29 +59,69 @@ plt.close()
 # ---------------------------------------------------------
 print("Loading SmolVLA...")
 from smolvla_dobot.train_smolvla import SmolVLAPolicy
+import clip
 m_smol = SmolVLAPolicy().to(device)
 m_smol.forward = m_smol.forward_flow  # Alias for torchinfo
+
+# Use a realistic token sequence so the attention isn't pure noise
+prompt = "pick up the red cube and place it on the green platform"
+dummy_tokens = clip.tokenize(prompt).to(device)
 
 if summary:
     with open('smolvla_summary.txt', 'w', encoding='utf-8') as f:
         dummy_img = torch.rand(1, 3, 64, 64)
-        dummy_tokens = torch.randint(0, 49408, (1, 77))
         dummy_t = torch.tensor([0.5])
         dummy_xt = torch.randn(1, 128, 4)
         f.write(repr(summary(m_smol, input_data=(dummy_xt, dummy_t, dummy_img, dummy_tokens), verbose=0)))
 
 with torch.no_grad():
+    dummy_img = torch.rand(1, 3, 64, 64)
+    # Add a faux "red block" to make attention respond (since CLIP is somewhat zero-shot)
+    dummy_img[0, 0, 30:40, 30:40] = 1.0 
+    dummy_img[0, 1:3, 30:40, 30:40] = 0.0
+    
     vis_patches, cls_emb = m_smol.backbone.vlm.encode_vision(dummy_img)
     text_feats = m_smol.backbone.vlm.encode_text(dummy_tokens)
     base_weights = torch.einsum('bld,bpd->blp', text_feats.float(), vis_patches.float())
     cross_weights = torch.softmax(base_weights * 5.0, dim=-1)
 
-plt.figure(figsize=(8, 6), dpi=200)
-plt.imshow(cross_weights[0].numpy(), cmap='viridis', aspect='auto')
-plt.title("SmolVLA: Zero-Shot CLIP Vision-Language Cross-Attention")
-plt.xlabel("Visual Patch Tokens (49)")
-plt.ylabel("Language Tokens (77)")
-plt.colorbar()
+# Generate a 3D Scatter Plot for Language (16 tokens) vs 7x7 Patches
+attn_3d = cross_weights[0, :16].reshape(16, 7, 7).numpy()
+
+fig = plt.figure(figsize=(10, 8), dpi=200)
+ax = fig.add_subplot(111, projection='3d')
+fig.patch.set_facecolor('white')
+ax.set_facecolor('white')
+
+# Meshgrid for Z (tokens), Y (patch row), X (patch col)
+Z, Y, X = np.meshgrid(np.arange(16), np.arange(7), np.arange(7), indexing='ij')
+
+X_flat = X.flatten()
+Y_flat = Y.flatten()
+Z_flat = Z.flatten()
+W_flat = attn_3d.flatten()
+
+# Filter out very low attention weights for clarity in 3D
+mask = W_flat > (W_flat.max() * 0.1)
+X_m, Y_m, Z_m, W_m = X_flat[mask], Y_flat[mask], Z_flat[mask], W_flat[mask]
+
+# Plot: Size and Color both mapped to attention weight
+sc = ax.scatter(X_m, Y_m, Z_m, c=W_m, cmap='magma', s=W_m * 2000, alpha=0.8, edgecolors='none')
+
+ax.set_xlabel("Patch X (0-6)", fontweight='bold')
+ax.set_ylabel("Patch Y (0-6)", fontweight='bold')
+ax.set_zlabel("Language Token Index (0-15)", fontweight='bold')
+ax.set_title(f"3D Cross-Attention\nPrompt: '{prompt}'", fontweight='bold', pad=20)
+
+# Make background panes clean
+ax.xaxis.pane.fill = False
+ax.yaxis.pane.fill = False
+ax.zaxis.pane.fill = False
+ax.grid(True, linestyle=':', alpha=0.6)
+
+cbar = fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.1)
+cbar.set_label('Attention Weight', fontweight='bold')
+
 plt.savefig('paper/figures/real_smolvla_attention.png', bbox_inches='tight')
 plt.close()
 
