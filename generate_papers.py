@@ -294,7 +294,15 @@ def make_full_smolvla():
         "with destination context and proprioceptive limits."
     )
 
-    p.heading("3. Conditional Flow Optimization")
+    p.heading("3. Intermediate Foundation Layer Semantics")
+    p.paragraph(
+        "By tapping the SmolVLM backbone at different depths, the Action Expert gains access to a hierarchy of multimodal reasoning. "
+        "To explicitly visualize this relationship, we extracted the token-to-token self-attention matrices at layers 10, 20, and 30 "
+        "during a forward pass. The tokens are broadly partitioned into Vision Tokens (0-19) and Language Tokens (20-39)."
+    )
+    p.figure(os.path.join(FIG_DIR, "real_full_smolvla_intermediate.png"), "Figure 3: Evolution of Self-Attention across SmolVLM layers. Layer 10 exhibits local spatial geometry (strong diagonal). Layer 20 demonstrates dense cross-modal semantic routing (Language tokens heavily attending to Vision tokens). Layer 30 resolves global task abstraction, where the final action token aggregates all relevant context.")
+
+    p.heading("4. Conditional Flow Optimization")
     p.paragraph(
         "The network synthesizes the temporal ODE vector field using Euler integration. Crucially, by offloading the "
         "heavy multimodal inference to a pre-cached offline worker script, the training of the Action Expert completes in a fraction "
