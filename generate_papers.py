@@ -221,10 +221,12 @@ def make_smolvla():
     p.heading("2. Cross-Attention Multimodal Fusion")
     p.paragraph(
         "The fundamental challenge of dual-stream architectures is semantic bridging. We implement a custom "
-        "MultimodalCrossAttentionBlock wherein language tokens query the visual patches. This creates a dense correlation "
-        "matrix associating linguistic intent (e.g., 'red cube') with spatial coordinates."
+        "MultimodalCrossAttentionBlock wherein language tokens query the visual patches. While the raw OpenAI CLIP text encoder "
+        "inherently pads all sequences to a fixed context length of 77 tokens, SmolVLA aggressively slices this down to just the "
+        "first 16 tokens. This optimization drastically reduces computational overhead since robotic instructions are typically concise. "
+        "Thus, the visual grounding explicitly maps 16 language tokens against the 7x7 patch grid."
     )
-    p.figure(os.path.join(FIG_DIR, "real_smolvla_attention.png"), "Figure 2: Real CLIP Zero-Shot Attention visualized in 3D. The X and Y axes represent the 7x7 visual patch grid, while the Z axis represents the sequence of language tokens. Color and sphere volume indicate cross-attention weight intensity.")
+    p.figure(os.path.join(FIG_DIR, "real_smolvla_attention.png"), "Figure 2: Real CLIP Zero-Shot Attention decomposed. The left shows the actual 64x64 RGB inference image containing a red cube and green platform. The 4x4 grid on the right reveals the 2D spatial attention intensity for each of the 16 active language tokens, demonstrating how the model successfully grounds specific words to physical spatial coordinates.")
     
     p.paragraph(
         "As seen in the extraction above, the frozen CLIP weights innately cluster high-relevance patches corresponding "

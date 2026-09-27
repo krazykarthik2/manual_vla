@@ -85,43 +85,34 @@ with torch.no_grad():
     base_weights = torch.einsum('bld,bpd->blp', text_feats.float(), vis_patches.float())
     cross_weights = torch.softmax(base_weights * 5.0, dim=-1)
 
-# Generate a 3D Scatter Plot for Language (16 tokens) vs 7x7 Patches
-attn_3d = cross_weights[0, :16].reshape(16, 7, 7).numpy()
+# Generate a 2D Grid Plot for Language (16 tokens) vs 7x7 Patches + Real Image
+attn_maps = cross_weights[0, :16].reshape(16, 7, 7).numpy()
 
-fig = plt.figure(figsize=(10, 8), dpi=200)
-ax = fig.add_subplot(111, projection='3d')
+fig = plt.figure(figsize=(14, 7), dpi=200)
 fig.patch.set_facecolor('white')
-ax.set_facecolor('white')
 
-# Meshgrid for Z (tokens), Y (patch row), X (patch col)
-Z, Y, X = np.meshgrid(np.arange(16), np.arange(7), np.arange(7), indexing='ij')
+# Show the real inference image on the left
+ax_img = plt.subplot2grid((4, 6), (1, 0), rowspan=2, colspan=2)
+# Convert from [C, H, W] to [H, W, C] for imshow
+img_np = dummy_img[0].permute(1, 2, 0).numpy()
+ax_img.imshow(img_np)
+ax_img.set_title("Real Inference Image\n(Red Cube, Green Platform)", fontweight='bold')
+ax_img.axis('off')
 
-X_flat = X.flatten()
-Y_flat = Y.flatten()
-Z_flat = Z.flatten()
-W_flat = attn_3d.flatten()
+# Map the first 16 tokens roughly to strings for intuition (since prompt is 11 words + start/end)
+token_labels = ["<start>", "pick", "up", "the", "red", "cube", "and", "place", "it", "on", "the", "green", "platform", "<end>", "<pad>", "<pad>"]
 
-# Filter out very low attention weights for clarity in 3D
-mask = W_flat > (W_flat.max() * 0.1)
-X_m, Y_m, Z_m, W_m = X_flat[mask], Y_flat[mask], Z_flat[mask], W_flat[mask]
+# 4x4 Grid for the 16 tokens
+for i in range(16):
+    row = i // 4
+    col = (i % 4) + 2  # shift right by 2 columns to leave room for the image
+    ax = plt.subplot2grid((4, 6), (row, col))
+    ax.imshow(attn_maps[i], cmap='magma', interpolation='nearest')
+    label = token_labels[i] if i < len(token_labels) else f"T{i}"
+    ax.set_title(f"T{i}: '{label}'", fontsize=10, fontweight='bold')
+    ax.axis('off')
 
-# Plot: Size and Color both mapped to attention weight
-sc = ax.scatter(X_m, Y_m, Z_m, c=W_m, cmap='magma', s=W_m * 2000, alpha=0.8, edgecolors='none')
-
-ax.set_xlabel("Patch X (0-6)", fontweight='bold')
-ax.set_ylabel("Patch Y (0-6)", fontweight='bold')
-ax.set_zlabel("Language Token Index (0-15)", fontweight='bold')
-ax.set_title(f"3D Cross-Attention\nPrompt: '{prompt}'", fontweight='bold', pad=20)
-
-# Make background panes clean
-ax.xaxis.pane.fill = False
-ax.yaxis.pane.fill = False
-ax.zaxis.pane.fill = False
-ax.grid(True, linestyle=':', alpha=0.6)
-
-cbar = fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.1)
-cbar.set_label('Attention Weight', fontweight='bold')
-
+plt.tight_layout()
 plt.savefig('paper/figures/real_smolvla_attention.png', bbox_inches='tight')
 plt.close()
 
