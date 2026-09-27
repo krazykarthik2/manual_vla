@@ -75,10 +75,16 @@ if summary:
         f.write(repr(summary(m_smol, input_data=(dummy_xt, dummy_t, dummy_img, dummy_tokens), verbose=0)))
 
 with torch.no_grad():
-    dummy_img = torch.rand(1, 3, 64, 64)
-    # Add a faux "red block" to make attention respond (since CLIP is somewhat zero-shot)
-    dummy_img[0, 0, 30:40, 30:40] = 1.0 
-    dummy_img[0, 1:3, 30:40, 30:40] = 0.0
+    dummy_img = torch.ones(1, 3, 64, 64) * 0.85 # Plain light-gray background
+    
+    # Add a distinct red square (top-left area)
+    dummy_img[0, 0, 15:28, 15:28] = 0.9
+    dummy_img[0, 1:3, 15:28, 15:28] = 0.1
+    
+    # Add a distinct green square (bottom-right area)
+    dummy_img[0, 1, 40:53, 40:53] = 0.9
+    dummy_img[0, 0, 40:53, 40:53] = 0.1
+    dummy_img[0, 2, 40:53, 40:53] = 0.1
     
     vis_patches, cls_emb = m_smol.backbone.vlm.encode_vision(dummy_img)
     text_feats = m_smol.backbone.vlm.encode_text(dummy_tokens)
