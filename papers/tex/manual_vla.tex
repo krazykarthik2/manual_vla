@@ -1,0 +1,52 @@
+\documentclass[10pt,twocolumn,letterpaper]{article}
+\usepackage[top=2cm,bottom=2.5cm,left=1.8cm,right=1.8cm,columnsep=0.8cm]{geometry}
+\usepackage{times}
+\usepackage{epsfig}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{subcaption}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+\title{\textbf{Manual VLA: Methodology and AI Architecture Overview}}
+\author{Autonomous Robotics \\& VLA Research Lab\texttt{https://github.com/krazykarthik2/manual_vla}}
+\date{September 2026}
+\begin{document}
+\maketitle
+\begin{abstract}
+This paper provides a high‑level methodology overview of the repository, summarising the design principles, comparative analysis, and overarching architecture that underpins both the SmolVLA and Full SmolVLA systems.
+\end{abstract}
+\section{Introduction}
+Embodied AI for robotic manipulation demands efficient perception‑action pipelines that can operate in real time. We present two compact multimodal policies—SmolVLA and Full SmolVLA—each built on a distinct backbone but sharing a common Optimal Transport Conditional Flow Matching (OT‑CFM) trajectory generation framework.
+\section{System Overview}
+Both systems ingest RGB images and natural‑language instructions, encode them via a vision‑language backbone, and generate 128‑step continuous trajectories for a 4‑DOF Dobot Magician robot. Figure~\ref{fig:arch_comparison} (shared from the original manuscript) illustrates the architectural differences.
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{../paper/figures/fig1_architectures.png}
+\caption{System Architecture Comparison. Left: SmolVLA dual‑stream pipeline with frozen CLIP ViT‑B/32. Right: Full SmolVLA using the SmolVLM‑256M foundation model.}
+\label{fig:arch_comparison}
+\end{figure*}
+\section{Comparative Analysis}
+The two approaches trade off inference latency against perceptual richness. SmolVLA achieves $>100$ Hz inference with a 1.4 M‑parameter decoder, while Full SmolVLA attains higher distractor robustness at $\approx30$ Hz with a 2.1 M‑parameter decoder.
+\section{Conclusion}
+We demonstrate that compact multimodal architectures can meet real‑time robotic demands without sacrificing performance, providing a practical foundation for edge‑deployed VLA systems.
+\bibliographystyle{plain}
+\begin{thebibliography}{1}
+\bibitem{lipman2022flow}
+Yaron Lipman, Ricky T.~Q. Chen, Heli Ben‑Hamu, Maximilian Nickel, and Matt Le.
+\newblock Flow matching for generative modeling.
+\newblock In {\em ICLR}, 2023.
+\bibitem{radford2021learning}
+Alec Radford et~al.
+\newblock Learning transferable visual models from natural language supervision.
+\newblock In {\em ICML}, 2021.
+\bib{smolvlm2024}
+Hugging Face SmolModels Team.
+\newblock SmolVLM: Small, fast, and capable multimodal vision‑language models.
+\newblock {\em Hugging Face Technical Report}, 2024.
+\end{thebibliography}
+\end{document}
