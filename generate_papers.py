@@ -1,5 +1,5 @@
 """
-generate_papers.py — Generates three PDF papers using fpdf2 (pure Python, no LaTeX engine needed).
+generate_papers.py  -  Generates three PDF papers using fpdf2 (pure Python, no LaTeX engine needed).
 Papers focus on METHODOLOGY and AI ARCHITECTURE only.
   1. papers/manual_vla.pdf
   2. papers/smolvla_dobot.pdf
@@ -118,6 +118,8 @@ def make_manual_vla():
     )
 
     p.section("2. System Overview")
+    fig1 = os.path.join(FIG_DIR, "fig1_manual_vla_arch.png")
+    p.add_fig(fig1, "Figure 1: Manual VLA Architecture - Patch Embedding, Hadamard Conditioning, Transformer Encoder.")
     p.body(
         "Manual VLA is the foundational architecture in the repository. Unlike SmolVLA or Full SmolVLA, "
         "it does not use any pretrained vision-language backbone. Instead, it employs a fully trainable, "
@@ -235,7 +237,7 @@ def make_smolvla_dobot():
     )
 
     p.section("2. Architecture Overview")
-    fig1 = os.path.join(FIG_DIR, "fig1_architectures.png")
+    fig1 = os.path.join(FIG_DIR, "fig2_smolvla_arch.png")
     p.add_fig(fig1, "Figure 1: SmolVLA dual-stream architecture with frozen CLIP ViT-B/32 backbone.")
 
     p.body(
@@ -332,7 +334,7 @@ def make_smolvla_dobot():
     )
 
     p.section("6. Flow Matching Action Decoder")
-    fig2 = os.path.join(FIG_DIR, "fig2_flow_matching.png")
+    fig2 = os.path.join(FIG_DIR, "fig4_flow_matching.png")
     p.add_fig(fig2, "Figure 2: OT-CFM linear interpolation and velocity field.")
     p.body(
         "The action decoder predicts 128-step continuous trajectories for 4 action dimensions "
@@ -345,7 +347,7 @@ def make_smolvla_dobot():
     )
 
     p.section("7. Visual Grounding Analysis")
-    fig3 = os.path.join(FIG_DIR, "fig3_attention_maps.png")
+    fig3 = os.path.join(FIG_DIR, "fig5_cross_attention.png")
     p.add_fig(fig3, "Figure 3: Cross-attention heatmaps and spatial grounding.")
 
     p.output(os.path.join(OUT_DIR, "smolvla_dobot.pdf"))
@@ -371,7 +373,7 @@ def make_full_smolvla_dobot():
     )
 
     p.section("2. Architecture Overview")
-    fig1 = os.path.join(FIG_DIR, "fig1_architectures.png")
+    fig1 = os.path.join(FIG_DIR, "fig3_full_smolvla_arch.png")
     p.add_fig(fig1, "Figure 1: Full SmolVLA architecture using SmolVLM-256M-Instruct backbone.")
     p.body(
         "Full SmolVLA consists of three major components:\n"
@@ -494,7 +496,7 @@ def make_full_smolvla_dobot():
     )
 
     p.section("7. Flow Matching Trajectory Generation")
-    fig2 = os.path.join(FIG_DIR, "fig2_flow_matching.png")
+    fig2 = os.path.join(FIG_DIR, "fig4_flow_matching.png")
     p.add_fig(fig2, "Figure 2: Optimal Transport Conditional Flow Matching dynamics.")
     p.body(
         "Training:\n"
