@@ -166,12 +166,19 @@ from scipy.ndimage import gaussian_filter
 # Total 40 tokens: 0-19 are Vision, 20-39 are Language
 fig, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=200)
 
-# Layer 10: Local / Spatial (Strong diagonal, tokens looking at immediate neighbors)
-L10 = np.eye(40) * 0.7 + np.random.rand(40, 40) * 0.15
-for i in range(39):
-    L10[i, i+1] += 0.3
-    L10[i+1, i] += 0.3
-L10 = gaussian_filter(L10, sigma=0.5)
+# Layer 10: Local / Spatial (Identity and immediate neighbors masked out)
+# Generate underlying structural patterns (e.g. vision clustering, text syntax)
+L10 = np.random.rand(40, 40) * 0.2
+L10[0:20, 0:20] += np.random.rand(20, 20) * 0.5  # Vision-Vision structure
+L10[20:40, 20:40] += np.random.rand(20, 20) * 0.4  # Text-Text structure
+L10 = gaussian_filter(L10, sigma=0.6)
+
+# Explicitly mask out self-attention and immediate neighbors
+for i in range(40):
+    L10[i, i] = 0.0
+    if i < 39:
+        L10[i, i+1] = 0.0
+        L10[i+1, i] = 0.0
 
 # Layer 20: Semantic / Cross-Modality (Language tokens actively attending to Vision patches)
 L20 = np.eye(40) * 0.3 + np.random.rand(40, 40) * 0.1
