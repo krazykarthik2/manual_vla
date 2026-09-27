@@ -299,10 +299,10 @@ def make_full_smolvla():
         "By tapping the SmolVLM backbone at different depths, the Action Expert gains access to a hierarchy of multimodal reasoning. "
         "To explicitly visualize this relationship, we extracted the token-to-token self-attention matrices at layers 10, 20, and 30 "
         "during a forward pass. The tokens are broadly partitioned into Vision Tokens (0-19) and Language Tokens (20-39). "
-        "In Layer 10, the identity mapping (self-attention) and immediate neighbor attention weights were explicitly masked out (set to zero) "
+        "In Layers 10 and 20, the identity mapping (self-attention) and immediate neighbor attention weights were explicitly masked out (set to zero) "
         "to prevent them from saturating the heatmap. This allows us to observe the true underlying structural relationships between broader token clusters."
     )
-    p.figure(os.path.join(FIG_DIR, "real_full_smolvla_intermediate.png"), "Figure 3: Evolution of Self-Attention across SmolVLM layers. The far-left shows the multimodal input state (RGB image + language instruction). Layer 10 exhibits local spatial geometry (with main diagonal and immediate neighbors explicitly masked out to reveal deeper structural variance). Layer 20 demonstrates dense cross-modal semantic routing (Language tokens heavily attending to Vision tokens). Layer 30 resolves global task abstraction, where the final action token aggregates all relevant context.")
+    p.figure(os.path.join(FIG_DIR, "real_full_smolvla_intermediate.png"), "Figure 3: Evolution of Self-Attention across SmolVLM layers. The far-left shows the multimodal input state (RGB image + language instruction). Layer 10 exhibits local spatial geometry. Layer 20 demonstrates dense cross-modal semantic routing (Language tokens heavily attending to Vision tokens). In both layers 10 and 20, the main diagonal and immediate neighbors are explicitly masked out to isolate the structural routing pathways. Layer 30 resolves global task abstraction, where the final action token aggregates all relevant context.")
 
     p.heading("4. Conditional Flow Optimization")
     p.paragraph(

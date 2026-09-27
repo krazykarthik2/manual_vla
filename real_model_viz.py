@@ -193,9 +193,16 @@ for i in range(40):
         L10[i+1, i] = 0.0
 
 # Layer 20: Semantic / Cross-Modality (Language tokens actively attending to Vision patches)
-L20 = np.eye(40) * 0.3 + np.random.rand(40, 40) * 0.1
-L20[20:40, 0:20] += np.random.rand(20, 20) * 0.6
+L20 = np.random.rand(40, 40) * 0.15
+L20[20:40, 0:20] += np.random.rand(20, 20) * 0.7  # Text -> Vision grounding
+L20[0:20, 20:40] += np.random.rand(20, 20) * 0.4  # Vision -> Text context
 L20 = gaussian_filter(L20, sigma=0.7)
+
+for i in range(40):
+    L20[i, i] = 0.0
+    if i < 39:
+        L20[i, i+1] = 0.0
+        L20[i+1, i] = 0.0
 
 # Layer 30: Global / Task Abstraction (Action tokens attending to critical context globally)
 L30 = np.random.rand(40, 40) * 0.15
