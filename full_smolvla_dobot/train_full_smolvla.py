@@ -30,8 +30,11 @@ from full_smolvla_model import FullSmolVLAPolicy
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if DEVICE.type == "cpu":
     NUM_CORES = os.cpu_count() or 4
-    torch.set_num_threads(NUM_CORES)
-    torch.set_num_interop_threads(NUM_CORES)
+    try:
+        torch.set_num_threads(NUM_CORES)
+        torch.set_num_interop_threads(NUM_CORES)
+    except:
+        pass
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "demonstrations")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
