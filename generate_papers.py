@@ -298,7 +298,7 @@ def make_full_smolvla():
     p.paragraph(
         "By tapping the SmolVLM backbone at different depths, the Action Expert gains access to a hierarchy of multimodal reasoning. "
         "To explicitly visualize this relationship, we extracted the token-to-token self-attention matrices at layers 10, 20, and 30 "
-        "during a forward pass. The tokens are broadly partitioned into Vision Tokens (0-15) and Language Tokens (16-39). "
+        "during a forward pass. The tokens are broadly partitioned into Vision Tokens (0-99) and Language Tokens (100-123). "
         "In Layers 10 and 20, the identity mapping (self-attention) and immediate neighbor attention weights were explicitly masked out (set to zero) "
         "to prevent them from saturating the heatmap. This allows us to observe the true underlying structural relationships between broader token clusters."
     )
@@ -306,10 +306,10 @@ def make_full_smolvla():
 
     p.paragraph(
         "To further dissect the dense semantic routing occurring in Layer 20, we isolate the text-to-vision attention block. "
-        "Since the visual sequence inherently corresponds to a 4x4 spatial grid, we can dynamically unfold the vision tokens back into their 2D spatial arrangement. "
-        "Below is the spatial grounding intensity for the sequence of language tokens against the 4x4 visual patch grid. The explicitly annotated numerical values are raw and normalized across the entire global token space, preserving their relative magnitudes."
+        "Since the visual sequence inherently corresponds to a fine-grained 10x10 spatial patch grid (100 tokens), we can dynamically unfold the vision tokens back into their 2D spatial arrangement. "
+        "Below is the spatial grounding intensity for the sequence of language tokens against the 10x10 visual patch grid. The explicitly annotated numerical values are raw and normalized across the entire global token space, preserving their relative magnitudes."
     )
-    p.figure(os.path.join(FIG_DIR, "real_full_smolvla_layer20_spatial.png"), "Figure 4: Spatial unfold of Layer 20 cross-modal attention. Each grid displays a text token's attention distributed across the 4x4 visual patch space. Values are explicitly annotated and retain their global normalization magnitudes.")
+    p.figure(os.path.join(FIG_DIR, "real_full_smolvla_layer20_spatial.png"), "Figure 4: Fine-grained spatial unfold of Layer 20 cross-modal attention. Each grid displays a text token's attention distributed across the 10x10 visual patch space. Values are explicitly annotated and retain their global normalization magnitudes.")
 
     p.heading("4. Conditional Flow Optimization")
     p.paragraph(
