@@ -150,7 +150,7 @@ def make_manual_vla():
         "into a 16x16 grid of 256 visual patches. A language prompt is mapped to an intent embedding, representing the "
         "target object and destination context."
     )
-    p.figure(os.path.join(FIG_DIR, "fig1_manual_vla_arch.png"), "Figure 1: Diagrammatic overview of the Manual VLA Architecture and processing pipeline.")
+    p.figure(os.path.join(FIG_DIR, "fig1_manual_vla_arch.png"), "Figure 1: 3D tensor block visualization of the Manual VLA Architecture showing data geometric flow from the input 2D image plane, fracturing into 3D patch pillars, merging with intent strips, and routing through translucent Transformer decoder layers.")
 
     p.sub_heading("2.1 Offline Network Activation Extraction")
     p.paragraph(
@@ -209,7 +209,7 @@ def make_smolvla():
         "catastrophic forgetting. Images are tokenized into 49 patches, and instructions are parsed into 77 byte-pair encoded tokens. "
         "These independent embeddings are projected to a 128-dimensional latent space before fusion."
     )
-    p.figure(os.path.join(FIG_DIR, "fig2_smolvla_arch.png"), "Figure 1: SmolVLA Dual-Stream Architecture integrating a frozen CLIP Backbone with Flow Matching.")
+    p.figure(os.path.join(FIG_DIR, "fig2_smolvla_arch.png"), "Figure 1: 3D tensor block diagram of the SmolVLA Dual-Stream Architecture. Notice the cross-attention web binding the sequence of language strips to the spatial visual pillars before routing into the unified decoder block.")
 
     p.sub_heading("1.1 Extracted Network Dimensions")
     p.paragraph(
@@ -268,7 +268,7 @@ def make_full_smolvla():
         "Layer 10 provides low-level spatial geometry, Layer 20 provides relational semantic maps, and Layer 30 resolves the "
         "global task abstraction."
     )
-    p.figure(os.path.join(FIG_DIR, "fig3_full_smolvla_arch.png"), "Figure 1: Full SmolVLA Architecture featuring the SmolVLM-256M backbone and intermediate layer tapping.")
+    p.figure(os.path.join(FIG_DIR, "fig3_full_smolvla_arch.png"), "Figure 1: 3D tensor volume of the Full SmolVLA Architecture featuring the stacked 30-layer SmolVLM-256M backbone. Wires demonstrate intermediate layer extraction routing to the downstream Action Expert.")
 
     p.sub_heading("1.1 Network Graph & Parameter Allocation")
     p.paragraph(
