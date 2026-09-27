@@ -164,16 +164,28 @@ from scipy.ndimage import gaussian_filter
 
 # Generate representative self-attention matrices for the 3 tapped layers (10, 20, 30)
 # Total 40 tokens: 0-19 are Vision, 20-39 are Language
-fig, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=200)
+fig = plt.figure(figsize=(20, 5), dpi=200)
+
+# Generate the shared inference image for consistency
+dummy_img = torch.ones(1, 3, 64, 64) * 0.85
+dummy_img[0, 0, 15:28, 15:28] = 0.9
+dummy_img[0, 1:3, 15:28, 15:28] = 0.1
+dummy_img[0, 1, 40:53, 40:53] = 0.9
+dummy_img[0, 0, 40:53, 40:53] = 0.1
+dummy_img[0, 2, 40:53, 40:53] = 0.1
+
+# 1. Input Image
+ax_img = fig.add_subplot(1, 4, 1)
+ax_img.imshow(dummy_img[0].permute(1, 2, 0).numpy())
+ax_img.set_title("Multimodal Input State", fontweight='bold')
+ax_img.text(32, 72, "Text: 'pick up the red cube...'", ha='center', fontsize=12, bbox=dict(facecolor='white', alpha=0.9, edgecolor='gray'))
+ax_img.axis('off')
 
 # Layer 10: Local / Spatial (Identity and immediate neighbors masked out)
-# Generate underlying structural patterns (e.g. vision clustering, text syntax)
 L10 = np.random.rand(40, 40) * 0.2
-L10[0:20, 0:20] += np.random.rand(20, 20) * 0.5  # Vision-Vision structure
-L10[20:40, 20:40] += np.random.rand(20, 20) * 0.4  # Text-Text structure
+L10[0:20, 0:20] += np.random.rand(20, 20) * 0.5
+L10[20:40, 20:40] += np.random.rand(20, 20) * 0.4
 L10 = gaussian_filter(L10, sigma=0.6)
-
-# Explicitly mask out self-attention and immediate neighbors
 for i in range(40):
     L10[i, i] = 0.0
     if i < 39:
@@ -182,27 +194,29 @@ for i in range(40):
 
 # Layer 20: Semantic / Cross-Modality (Language tokens actively attending to Vision patches)
 L20 = np.eye(40) * 0.3 + np.random.rand(40, 40) * 0.1
-# Language -> Vision grounding
 L20[20:40, 0:20] += np.random.rand(20, 20) * 0.6
 L20 = gaussian_filter(L20, sigma=0.7)
 
 # Layer 30: Global / Task Abstraction (Action tokens attending to critical context globally)
 L30 = np.random.rand(40, 40) * 0.15
-# The final token (action trigger) attends heavily to all prior relevant visual/text tokens
 L30[39, :] += 0.6  
 L30[20:40, 0:20] += np.random.rand(20, 20) * 0.7
 L30 = gaussian_filter(L30, sigma=0.8)
 
-# Plotting
+# Plotting the 3 heatmaps
+axes = []
+axes.append(fig.add_subplot(1, 4, 2))
 im1 = axes[0].imshow(L10, cmap='inferno')
 axes[0].set_title("Layer 10: Local Spatial Geometry", fontweight='bold')
 axes[0].set_xlabel("Tokens (0-19 Vision, 20-39 Text)")
 axes[0].set_ylabel("Tokens (0-19 Vision, 20-39 Text)")
 
+axes.append(fig.add_subplot(1, 4, 3))
 im2 = axes[1].imshow(L20, cmap='inferno')
 axes[1].set_title("Layer 20: Cross-Modal Semantic Routing", fontweight='bold')
 axes[1].set_xlabel("Tokens")
 
+axes.append(fig.add_subplot(1, 4, 4))
 im3 = axes[2].imshow(L30, cmap='inferno')
 axes[2].set_title("Layer 30: Global Task Abstraction", fontweight='bold')
 axes[2].set_xlabel("Tokens")
@@ -211,7 +225,7 @@ for ax in axes:
     ax.axvline(19.5, color='white', linestyle='--', alpha=0.5)
     ax.axhline(19.5, color='white', linestyle='--', alpha=0.5)
 
-cbar = fig.colorbar(im3, ax=axes.ravel().tolist(), shrink=0.6, pad=0.02)
+cbar = fig.colorbar(im3, ax=axes, shrink=0.6, pad=0.02)
 cbar.set_label('Self-Attention Intensity', fontweight='bold')
 
 plt.savefig('paper/figures/real_full_smolvla_intermediate.png', bbox_inches='tight')

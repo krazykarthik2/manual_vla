@@ -302,7 +302,7 @@ def make_full_smolvla():
         "In Layer 10, the identity mapping (self-attention) and immediate neighbor attention weights were explicitly masked out (set to zero) "
         "to prevent them from saturating the heatmap. This allows us to observe the true underlying structural relationships between broader token clusters."
     )
-    p.figure(os.path.join(FIG_DIR, "real_full_smolvla_intermediate.png"), "Figure 3: Evolution of Self-Attention across SmolVLM layers. Layer 10 exhibits local spatial geometry (with main diagonal and immediate neighbors explicitly masked out to reveal deeper structural variance). Layer 20 demonstrates dense cross-modal semantic routing (Language tokens heavily attending to Vision tokens). Layer 30 resolves global task abstraction, where the final action token aggregates all relevant context.")
+    p.figure(os.path.join(FIG_DIR, "real_full_smolvla_intermediate.png"), "Figure 3: Evolution of Self-Attention across SmolVLM layers. The far-left shows the multimodal input state (RGB image + language instruction). Layer 10 exhibits local spatial geometry (with main diagonal and immediate neighbors explicitly masked out to reveal deeper structural variance). Layer 20 demonstrates dense cross-modal semantic routing (Language tokens heavily attending to Vision tokens). Layer 30 resolves global task abstraction, where the final action token aggregates all relevant context.")
 
     p.heading("4. Conditional Flow Optimization")
     p.paragraph(
