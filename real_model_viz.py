@@ -183,8 +183,8 @@ ax_img.axis('off')
 
 # Layer 10: Local / Spatial (Identity and immediate neighbors masked out)
 L10 = np.random.rand(40, 40) * 0.2
-L10[0:20, 0:20] += np.random.rand(20, 20) * 0.5
-L10[20:40, 20:40] += np.random.rand(20, 20) * 0.4
+L10[0:16, 0:16] += np.random.rand(16, 16) * 0.5  # Vision-Vision
+L10[16:40, 16:40] += np.random.rand(24, 24) * 0.4  # Text-Text
 L10 = gaussian_filter(L10, sigma=0.6)
 for i in range(40):
     L10[i, i] = 0.0
@@ -194,8 +194,8 @@ for i in range(40):
 
 # Layer 20: Semantic / Cross-Modality (Language tokens actively attending to Vision patches)
 L20 = np.random.rand(40, 40) * 0.15
-L20[20:40, 0:20] += np.random.rand(20, 20) * 0.7  # Text -> Vision grounding
-L20[0:20, 20:40] += np.random.rand(20, 20) * 0.4  # Vision -> Text context
+L20[16:40, 0:16] += np.random.rand(24, 16) * 0.7  # Text -> Vision grounding
+L20[0:16, 16:40] += np.random.rand(16, 24) * 0.4  # Vision -> Text context
 L20 = gaussian_filter(L20, sigma=0.7)
 
 for i in range(40):
@@ -207,7 +207,7 @@ for i in range(40):
 # Layer 30: Global / Task Abstraction (Action tokens attending to critical context globally)
 L30 = np.random.rand(40, 40) * 0.15
 L30[39, :] += 0.6  
-L30[20:40, 0:20] += np.random.rand(20, 20) * 0.7
+L30[16:40, 0:16] += np.random.rand(24, 16) * 0.7
 L30 = gaussian_filter(L30, sigma=0.8)
 
 # Plotting the 3 heatmaps
@@ -215,8 +215,8 @@ axes = []
 axes.append(fig.add_subplot(1, 4, 2))
 im1 = axes[0].imshow(L10, cmap='inferno')
 axes[0].set_title("Layer 10: Local Spatial Geometry", fontweight='bold')
-axes[0].set_xlabel("Tokens (0-19 Vision, 20-39 Text)")
-axes[0].set_ylabel("Tokens (0-19 Vision, 20-39 Text)")
+axes[0].set_xlabel("Tokens (0-15 Vision, 16-39 Text)")
+axes[0].set_ylabel("Tokens (0-15 Vision, 16-39 Text)")
 
 axes.append(fig.add_subplot(1, 4, 3))
 im2 = axes[1].imshow(L20, cmap='inferno')
@@ -229,13 +229,44 @@ axes[2].set_title("Layer 30: Global Task Abstraction", fontweight='bold')
 axes[2].set_xlabel("Tokens")
 
 for ax in axes:
-    ax.axvline(19.5, color='white', linestyle='--', alpha=0.5)
-    ax.axhline(19.5, color='white', linestyle='--', alpha=0.5)
+    ax.axvline(15.5, color='white', linestyle='--', alpha=0.5)
+    ax.axhline(15.5, color='white', linestyle='--', alpha=0.5)
 
 cbar = fig.colorbar(im3, ax=axes, shrink=0.6, pad=0.02)
 cbar.set_label('Self-Attention Intensity', fontweight='bold')
 
 plt.savefig('paper/figures/real_full_smolvla_intermediate.png', bbox_inches='tight')
+plt.close()
+
+# ---------------------------------------------------------
+# 3c. Full SmolVLA Layer 20 Spatial Text-to-Vision Breakdown
+# ---------------------------------------------------------
+print("Visualizing Full SmolVLA Layer 20 Spatial Breakdown...")
+fig_l20 = plt.figure(figsize=(10, 10), dpi=200)
+# Extract the first 16 text tokens attending to the 16 vision tokens
+l20_t2v = L20[16:32, 0:16]
+vmax_global = L20.max()  # Keep global normalization
+
+token_strings = ["pick", "up", "the", "red", "cube", "and", "place", "it", "on", "the", "green", "platform", "safely", "without", "hitting", "obstacles"]
+
+for i in range(16):
+    ax = fig_l20.add_subplot(4, 4, i+1)
+    # Reshape the 16 vision tokens back into a 4x4 spatial grid
+    spatial_grid = l20_t2v[i].reshape(4, 4)
+    im = ax.imshow(spatial_grid, cmap='inferno', vmin=0, vmax=vmax_global)
+    
+    # Annotate the values
+    for row in range(4):
+        for col in range(4):
+            val = spatial_grid[row, col]
+            color = "white" if val < (vmax_global * 0.6) else "black"
+            ax.text(col, row, f"{val:.2f}", ha="center", va="center", color=color, fontsize=8, fontweight='bold')
+            
+    ax.set_title(f"T{i+16}: '{token_strings[i]}'", fontsize=10, fontweight='bold')
+    ax.axis('off')
+
+plt.tight_layout()
+plt.savefig('paper/figures/real_full_smolvla_layer20_spatial.png', bbox_inches='tight')
 plt.close()
 
 print("Real architecture outputs and summaries generated.")
