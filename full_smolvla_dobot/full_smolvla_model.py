@@ -34,7 +34,7 @@ class FullSmolVLAPolicy(nn.Module):
     - Continuous Sinusoidal Diffusion Time + Proprioception Conditioning
     - Multimodal Cross-Attention Action Decoder Head over Horizon H=128 for 4D actions (x, y, z, grip)
     """
-    def __init__(self, d_action_model=128, horizon=128, action_dim=4, freeze_backbone=True, load_backbone=True, smolvlm_hidden_dim=576, device='cpu'):
+    def __init__(self, d_action_model=256, horizon=128, action_dim=4, freeze_backbone=True, load_backbone=True, smolvlm_hidden_dim=576, device='cpu'):
         super().__init__()
         self.horizon = horizon
         self.action_dim = action_dim

@@ -16,7 +16,7 @@ def run_full_smolvla(fast_mode=False):
     device = DEVICE
     model_path = os.path.join(MODEL_DIR, "dobot_full_smolvla_policy.pth")
 
-    model = FullSmolVLAPolicy(d_action_model=128, device=device).to(device)
+    model = FullSmolVLAPolicy(d_action_model=256, device=device).to(device)
     if not os.path.exists(model_path):
         print("\n" + "=" * 68, flush=True)
         print(f"[ERROR] No trained Full SmolVLA checkpoint found at: {model_path}", flush=True)
@@ -126,7 +126,7 @@ def run_full_smolvla(fast_mode=False):
                         episode_total_ticks = 0
                 else:
                     episode_total_ticks += 1
-                    need_replan = (current_trajectory is None) or (traj_step >= len(current_trajectory))
+                    need_replan = (current_trajectory is None) or (traj_step >= 8)
 
                     if need_replan:
                         with torch.no_grad():
@@ -136,12 +136,29 @@ def run_full_smolvla(fast_mode=False):
                             proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0).to(device)
 
                             sample_steps = 10 if lightspeed else 15
-                            current_trajectory = model.sample(
+                            new_traj = model.sample(
                                 [pil_img],
                                 [sim.instruction],
                                 proprio=proprio_t,
                                 num_steps=sample_steps
                             ).squeeze(0).cpu().numpy()
+
+                            if current_trajectory is None:
+                                current_trajectory = new_traj
+                            else:
+                                # Temporal Ensembling: Shift the remaining trajectory back by `traj_step` 
+                                # and exponentially average with the newly predicted trajectory.
+                                shifted_traj = np.zeros_like(current_trajectory)
+                                shift = traj_step
+                                valid_len = len(current_trajectory) - shift
+                                if valid_len > 0:
+                                    shifted_traj[:valid_len] = current_trajectory[shift:]
+                                    shifted_traj[valid_len:] = new_traj[valid_len:] # Pad with new if we run out
+                                
+                                # Soft update (Exponential Moving Average / Temporal Ensemble)
+                                alpha = np.linspace(0.8, 0.2, len(current_trajectory))[:, None]
+                                current_trajectory = (1 - alpha) * shifted_traj + alpha * new_traj
+
                             traj_step = 0
 
                     if current_trajectory is not None and traj_step < len(current_trajectory):
@@ -152,9 +169,6 @@ def run_full_smolvla(fast_mode=False):
                         advance_threshold = 0.012 if lightspeed else 0.008
                         if dist_to_pt < advance_threshold:
                             traj_step += 2 if lightspeed else 1
-                            if traj_step < len(current_trajectory):
-                                target_point = current_trajectory[traj_step]
-                                diff_xyz = target_point[:3] - sim.ee_pos[:3]
                         else:
                             traj_step += 2 if lightspeed else 1
 

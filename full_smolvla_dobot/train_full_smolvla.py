@@ -145,7 +145,7 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, shards_d
         target_device = "cpu"
 
     try:
-        policy = FullSmolVLAPolicy(d_action_model=128, load_backbone=True, device=target_device)
+        policy = FullSmolVLAPolicy(d_action_model=256, load_backbone=True, device=target_device)
 
         for i in range(0, len(indexed_files), cache_batch_size):
             chunk = indexed_files[i:i + cache_batch_size]
@@ -416,7 +416,7 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
     )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=pad_collate_fn)
 
-    policy = FullSmolVLAPolicy(d_action_model=128, load_backbone=False, device=DEVICE).to(DEVICE)
+    policy = FullSmolVLAPolicy(d_action_model=256, load_backbone=False, device=DEVICE).to(DEVICE)
     policy.train()
 
     trainable_params = [p for p in policy.parameters() if p.requires_grad]

@@ -9,4 +9,4 @@ echo   [1]     Action: Pick and Place
 echo   [R]     Randomize Table Clutter
 echo   [SPACE] Pause / Resume Execution
 echo =========================================================
-python run_full_smolvla.py --fast %*
+python run_full_smolvla.py %*

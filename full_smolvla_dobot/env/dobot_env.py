@@ -53,7 +53,7 @@ class DobotPickPlaceSim:
     Simulation Environment for Vision-Language-Action (VLA) Learning with Visual Distractors:
     - Multi-object visual scene (Target Object + Distractor Objects + Target Platform + Distractor Platforms)
     - Modalities:
-        * RGB Camera Image: [3, 64, 64] float32 in [0, 1]
+        * RGB Camera Image: [3, 128, 128] float32 in [0, 1]
         * Proprioception Robot State: [ee_x, ee_y, ee_z, ee_yaw, gripper_status] (5 dims)
         * Language Instruction: prompt string
     """
@@ -79,7 +79,7 @@ class DobotPickPlaceSim:
         
         # Pygame surface for camera rendering
         pygame.init()
-        self.cam_surface = pygame.Surface((64, 64))
+        self.cam_surface = pygame.Surface((128, 128))
         self.reset()
 
     # Aliases for backward compatibility
@@ -172,44 +172,40 @@ class DobotPickPlaceSim:
         surf.fill((30, 32, 40))
 
         def to_cam_px(x, y):
-            px = int(32 + (y / 0.28) * 28)
-            py = int(58 - ((x - 0.10) / 0.25) * 52)
+            px = int(64 + (y / 0.28) * 56)
+            py = int(116 - ((x - 0.10) / 0.25) * 104)
             return px, py
-
-        # Physical-to-pixel scaling: y-axis ~100 px/m, x-axis ~208 px/m
-        # Platform (0.035m): ~7px wide x ~7px tall
-        # Cube (0.022m): ~5px wide x ~5px tall
 
         # Platforms (flat landing pads)
         for plat_color, p_pos in self.distractor_platforms:
             gx, gy = to_cam_px(p_pos[0], p_pos[1])
             col = COLOR_PALETTE.get(plat_color, (40, 210, 80))
-            pygame.draw.rect(surf, col, (gx - 3, gy - 3, 7, 7), border_radius=1)
+            pygame.draw.rect(surf, col, (gx - 6, gy - 6, 14, 14), border_radius=2)
 
         tgx, tgy = to_cam_px(self.target_platform_pos[0], self.target_platform_pos[1])
         t_col = COLOR_PALETTE.get(self.target_plat_color, (40, 210, 80))
-        pygame.draw.rect(surf, t_col, (tgx - 3, tgy - 3, 7, 7), border_radius=1)
-        pygame.draw.rect(surf, (255, 255, 255), (tgx - 3, tgy - 3, 7, 7), 1, border_radius=1)
+        pygame.draw.rect(surf, t_col, (tgx - 6, tgy - 6, 14, 14), border_radius=2)
+        pygame.draw.rect(surf, (255, 255, 255), (tgx - 6, tgy - 6, 14, 14), 2, border_radius=2)
 
         # Cubes (small objects)
         for cube_color, c_pos in self.distractor_cubes:
             cx, cy = to_cam_px(c_pos[0], c_pos[1])
             col = COLOR_PALETTE.get(cube_color, (45, 120, 240))
-            pygame.draw.rect(surf, col, (cx - 2, cy - 2, 5, 5))
+            pygame.draw.rect(surf, col, (cx - 4, cy - 4, 10, 10))
 
         tcx, tcy = to_cam_px(self.target_cube_pos[0], self.target_cube_pos[1])
         tc_col = COLOR_PALETTE.get(self.target_color, (240, 45, 45))
-        pygame.draw.rect(surf, tc_col, (tcx - 2, tcy - 2, 5, 5))
+        pygame.draw.rect(surf, tc_col, (tcx - 4, tcy - 4, 10, 10))
 
         # Base & Linkage
         bx, by = to_cam_px(0.08, 0.0)
-        pygame.draw.circle(surf, (90, 95, 115), (bx, by), 5)
+        pygame.draw.circle(surf, (90, 95, 115), (bx, by), 10)
 
         ex, ey = to_cam_px(self.ee_pos[0], self.ee_pos[1])
-        pygame.draw.line(surf, (170, 175, 195), (bx, by), (ex, ey), 2)
+        pygame.draw.line(surf, (170, 175, 195), (bx, by), (ex, ey), 4)
 
         grip_color = (255, 90, 90) if self.gripper_closed else (90, 200, 255)
-        pygame.draw.circle(surf, grip_color, (ex, ey), 3)
+        pygame.draw.circle(surf, grip_color, (ex, ey), 6)
 
         rgb_hwc = pygame.surfarray.array3d(surf)
         rgb_chw = np.transpose(rgb_hwc, (2, 1, 0)).astype(np.float32) / 255.0
