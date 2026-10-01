@@ -144,7 +144,7 @@ class FullSmolVLAPolicy(nn.Module):
             ]
             formatted_prompts.append(self.processor.apply_chat_template(messages, add_generation_prompt=False))
 
-        inputs = self.processor(text=formatted_prompts, images=images_pil, return_tensors="pt")
+        inputs = self.processor(text=formatted_prompts, images=images_pil, return_tensors="pt", padding=True)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():
