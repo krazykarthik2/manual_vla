@@ -27,6 +27,8 @@ def run_full_smolvla(fast_mode=False):
     try:
         ckpt = torch.load(model_path, map_location=device)
         model.load_state_dict(ckpt, strict=False)
+        if device.type == 'cpu':
+            model = model.float() # Prevents 'bfloat16 not supported' on Intel/AMD CPUs
         model.eval()
         print(f"[INFO] Full SmolVLA Model (SmolVLM backbone) loaded from {model_path}!", flush=True)
     except Exception as e:
@@ -126,8 +128,10 @@ def run_full_smolvla(fast_mode=False):
                         episode_total_ticks = 0
                 else:
                     episode_total_ticks += 1
-                    need_replan = (current_trajectory is None) or (traj_step >= 8)
-
+                    
+                    replan_interval = 8 if device.type == "cuda" else 64
+                    need_replan = (current_trajectory is None) or (traj_step >= replan_interval)
+                    
                     if need_replan:
                         with torch.no_grad():
                             img_chw = obs["image"]
