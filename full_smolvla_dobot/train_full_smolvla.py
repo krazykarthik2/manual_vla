@@ -168,21 +168,29 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, shards_d
             batch_imgs = []
             batch_prompts = []
             orig_indices = []
+            selected_ts = []
 
             for idx, f in chunk:
                 d = np.load(f, allow_pickle=True)
-                img_chw = d['images'][0] # [3, 64, 64]
+                actions = d['actions']
+                
+                # Covariate Shift Fix: Randomly slice the demonstration to train mid-task recovery
+                max_t = max(0, len(actions) - 16)
+                t = int(np.random.randint(0, max_t + 1))
+                
+                img_chw = d['images'][t]
                 img_hwc = (np.transpose(img_chw, (1, 2, 0)) * 255).astype(np.uint8)
                 batch_imgs.append(Image.fromarray(img_hwc))
                 batch_prompts.append(str(d['prompt'][0]))
                 orig_indices.append(idx)
+                selected_ts.append(t)
 
             with torch.no_grad():
                 raw_h = policy.extract_smolvlm_context(batch_imgs, batch_prompts, return_raw_hidden=True)
 
             batch_results = []
             for j, orig_idx in enumerate(orig_indices):
-                batch_results.append((orig_idx, raw_h[j].half().cpu()))
+                batch_results.append((orig_idx, selected_ts[j], raw_h[j].half().cpu()))
 
             # Incrementally save batch shard to disk immediately
             chunk_file = os.path.join(shards_dir, f"shard_{orig_indices[0]:06d}_{orig_indices[-1]:06d}.pt")
@@ -334,8 +342,13 @@ class FastFullSmolVLADataset(Dataset):
         for sf in glob.glob(os.path.join(SHARDS_DIR, "shard_*.pt")):
             try:
                 items = torch.load(sf, map_location="cpu")
-                for orig_idx, tensor in items:
-                    all_results[orig_idx] = tensor
+                for item in items:
+                    if len(item) == 3:
+                        orig_idx, t, tensor = item
+                    else:
+                        orig_idx, tensor = item
+                        t = 0
+                    all_results[orig_idx] = (t, tensor)
             except Exception:
                 pass
         
@@ -347,13 +360,26 @@ class FastFullSmolVLADataset(Dataset):
             proprio = d['proprioception'].astype(np.float32)
             acts = d['actions'].astype(np.float32)
 
-            raw_traj = np.concatenate([proprio[:, :3], acts[:, 4:5]], axis=-1)
+            t, vlm_tensor = cached_raw[idx]
+
+            raw_traj = np.concatenate([proprio[t:, :3], acts[t:, 4:5]], axis=-1)
+            
+            # Pad the trajectory up to 128 steps by repeating the final state. 
+            # This teaches the robot to hold steady after completing the task.
+            pad_len = 128 - len(raw_traj)
+            if pad_len > 0:
+                final_state = raw_traj[-1:]
+                padding = np.repeat(final_state, pad_len, axis=0)
+                raw_traj = np.concatenate([raw_traj, padding], axis=0)
+            elif pad_len < 0:
+                raw_traj = raw_traj[:128]
+
             norm_traj = (torch.tensor(raw_traj, dtype=torch.float32) - ACTION_MEAN) / (ACTION_STD + 1e-6)
-            proprio0 = torch.tensor(proprio[0], dtype=torch.float32)
+            proprio_t = torch.tensor(proprio[t], dtype=torch.float32)
 
             self.samples.append((
-                cached_raw[idx],
-                proprio0,
+                vlm_tensor,
+                proprio_t,
                 norm_traj
             ))
 
