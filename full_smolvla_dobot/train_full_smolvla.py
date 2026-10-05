@@ -64,7 +64,12 @@ def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, use
         if user_workers_per_gpu is not None and user_workers_per_gpu > 0:
             workers_per_gpu = user_workers_per_gpu
         else:
-            workers_per_gpu = 1
+            if total_vram_gb >= 24:
+                workers_per_gpu = 4
+            elif total_vram_gb >= 14:
+                workers_per_gpu = 2
+            else:
+                workers_per_gpu = 1
 
         if user_num_workers is not None and user_num_workers > 0:
             num_workers = user_num_workers
@@ -177,7 +182,7 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, shards_d
 
             batch_results = []
             for j, orig_idx in enumerate(orig_indices):
-                batch_results.append((orig_idx, raw_h[j].float().cpu()))
+                batch_results.append((orig_idx, raw_h[j].half().cpu()))
 
             # Incrementally save batch shard to disk immediately
             chunk_file = os.path.join(shards_dir, f"shard_{orig_indices[0]:06d}_{orig_indices[-1]:06d}.pt")
