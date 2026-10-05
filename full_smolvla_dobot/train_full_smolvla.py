@@ -298,74 +298,48 @@ def run_parallel_caching(files, cache_file, shards_dir=SHARDS_DIR, num_workers=N
     if len(all_results) != num_demos:
         raise RuntimeError(f"Parallel caching gathered {len(all_results)}/{num_demos} items. Some workers may have failed.")
 
-    # Sort in exact demonstration order
-    cached_raw_hidden = [all_results[i] for i in range(num_demos)]
-
-    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-    torch.save({
-        'version': CACHE_VERSION,
-        'files': files,
-        'raw_hidden': cached_raw_hidden
-    }, cache_file)
-    print(f">> [DONE] Master SmolVLM cache assembled and saved -> {cache_file}", flush=True)
-
-    # Clean up intermediate shard files
-    for sf in final_shard_files:
-        try:
-            os.remove(sf)
-        except OSError:
-            pass
+    print(f">> [DONE] Master SmolVLM cache successfully extracted and distributed across chunk shards in {shards_dir}", flush=True)
 
 class FastFullSmolVLADataset(Dataset):
     """
     High-Performance Dataset with Auto-Tuned Multi-GPU / Multi-Worker Parallel Pre-Computed Features.
     """
     def __init__(self, data_dir, cache_file=CACHE_FILE, force_recache=False, num_workers=None, workers_per_gpu=None, cache_batch_size=None):
-        valid_cache = False
-        if os.path.exists(cache_file) and not force_recache:
-            try:
-                print(f">> Checking SmolVLM cache at {cache_file}...", flush=True)
-                cache = torch.load(cache_file, map_location="cpu")
-                if isinstance(cache, dict) and cache.get("version") == CACHE_VERSION and "raw_hidden" in cache:
-                    valid_cache = True
-                else:
-                    print(">> Cache version mismatch or legacy format. Regenerating cache...", flush=True)
-            except Exception as e:
-                print(f">> Cache file corrupted ({e}). Regenerating cache...", flush=True)
-
-        if not valid_cache:
-            if os.path.exists(cache_file) and force_recache:
+        if force_recache:
+            for sf in glob.glob(os.path.join(SHARDS_DIR, "shard_*.pt")):
                 try:
-                    os.remove(cache_file)
+                    os.remove(sf)
                 except OSError:
                     pass
-                # Also clean shards if forced recache
-                for sf in glob.glob(os.path.join(SHARDS_DIR, "shard_*.pt")):
-                    try:
-                        os.remove(sf)
-                    except OSError:
-                        pass
 
+        files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
+        if not files:
+            print(">> No demonstrations found. Auto-generating 100 clean demonstrations...", flush=True)
+            from auto_generate_demos import run_auto_demonstrator
+            run_auto_demonstrator(num_demos=100)
             files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
-            if not files:
-                print(">> No demonstrations found. Auto-generating 100 clean demonstrations...", flush=True)
-                from auto_generate_demos import run_auto_demonstrator
-                run_auto_demonstrator(num_demos=100)
-                files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
 
-            run_parallel_caching(
-                files=files,
-                cache_file=cache_file,
-                shards_dir=SHARDS_DIR,
-                num_workers=num_workers,
-                workers_per_gpu=workers_per_gpu,
-                cache_batch_size=cache_batch_size
-            )
+        # run_parallel_caching intelligently resumes or builds missing shards
+        run_parallel_caching(
+            files=files,
+            cache_file=cache_file,
+            shards_dir=SHARDS_DIR,
+            num_workers=num_workers,
+            workers_per_gpu=workers_per_gpu,
+            cache_batch_size=cache_batch_size
+        )
 
-        print(f">> Loading Precomputed SmolVLM multi-layer features into memory...", flush=True)
-        cache = torch.load(cache_file, map_location="cpu")
-        files = cache['files']
-        cached_raw = cache['raw_hidden']
+        print(f">> Loading Precomputed SmolVLM multi-layer features into memory directly from chunk shards...", flush=True)
+        all_results = {}
+        for sf in glob.glob(os.path.join(SHARDS_DIR, "shard_*.pt")):
+            try:
+                items = torch.load(sf, map_location="cpu")
+                for orig_idx, tensor in items:
+                    all_results[orig_idx] = tensor
+            except Exception:
+                pass
+        
+        cached_raw = [all_results[i] for i in range(len(files))]
 
         self.samples = []
         for idx, f in enumerate(files):
