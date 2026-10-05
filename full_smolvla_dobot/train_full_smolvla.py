@@ -60,8 +60,8 @@ def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, use
             total_vram_gb = 16.0
             gpu_name = "CUDA GPU"
 
-        # 1 dedicated worker per GPU is cleanest & fastest without VRAM contention
-        vram_per_gpu = (total_vram_gb / num_gpus) if num_gpus > 0 else 0
+        # total_vram_gb is already per-GPU (device 0)
+        vram_per_gpu = total_vram_gb
         if user_workers_per_gpu is not None and user_workers_per_gpu > 0:
             workers_per_gpu = user_workers_per_gpu
         else:
