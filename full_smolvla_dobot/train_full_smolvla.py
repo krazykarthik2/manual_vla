@@ -238,7 +238,11 @@ def run_parallel_caching(files, cache_file, shards_dir=SHARDS_DIR, num_workers=N
     for sf in existing_shard_files:
         try:
             items = torch.load(sf, map_location="cpu")
-            for orig_idx, tensor in items:
+            for item in items:
+                if len(item) == 3:
+                    orig_idx, t, tensor = item
+                else:
+                    orig_idx, tensor = item
                 existing_cached_items[orig_idx] = tensor
         except Exception:
             pass
@@ -299,7 +303,11 @@ def run_parallel_caching(files, cache_file, shards_dir=SHARDS_DIR, num_workers=N
     for sf in final_shard_files:
         try:
             items = torch.load(sf, map_location="cpu")
-            for orig_idx, tensor in items:
+            for item in items:
+                if len(item) == 3:
+                    orig_idx, t, tensor = item
+                else:
+                    orig_idx, tensor = item
                 all_results[orig_idx] = tensor
         except Exception as e:
             print(f"[WARN] Corrupt shard file {sf}: {e}", flush=True)
