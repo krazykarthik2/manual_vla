@@ -129,7 +129,10 @@ def run_full_smolvla(fast_mode=False):
                 else:
                     episode_total_ticks += 1
                     
-                    replan_interval = 8 if device.type == "cuda" else 64
+                    # Allow disabling the periodic replanning horizon
+                    # If REPLAN_INTERVAL is set (e.g. 9999) the policy will run a single uninterrupted trajectory.
+                    # Otherwise we fall back to the original 8‑step (CUDA) / 64‑step (CPU) schedule.
+                    replan_interval = int(os.getenv("REPLAN_INTERVAL", str(8 if device.type == "cuda" else 64)))
                     need_replan = (current_trajectory is None) or (traj_step >= replan_interval)
                     
                     if need_replan:
