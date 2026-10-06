@@ -60,32 +60,30 @@ def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, use
             total_vram_gb = 16.0
             gpu_name = "CUDA GPU"
 
-        # total_vram_gb is already per-GPU (device 0)
-        vram_per_gpu = total_vram_gb
+        # Single worker per GPU is mathematically safest. PyTorch multi-processing
+        # fragments CUDA allocators causing fatal overlapping VRAM spikes.
         if user_workers_per_gpu is not None and user_workers_per_gpu > 0:
             workers_per_gpu = user_workers_per_gpu
         else:
-            if vram_per_gpu >= 40:
-                workers_per_gpu = 2
-            elif vram_per_gpu >= 14:
-                workers_per_gpu = 1
-            else:
-                workers_per_gpu = 1
+            workers_per_gpu = 1
 
         if user_num_workers is not None and user_num_workers > 0:
             num_workers = user_num_workers
         else:
             num_workers = num_gpus * workers_per_gpu
 
-        # Auto scale cache batch size based on VRAM (128x128 images take a lot of attention memory)
-        if total_vram_gb >= 24:
+        # Auto scale cache batch size based on VRAM (128x128 images take extreme attention memory)
+        # We heavily throttle this to absolutely guarantee no out-of-memory errors.
+        if total_vram_gb >= 40:
             cache_batch_size = 16
-        elif total_vram_gb >= 16:
+        elif total_vram_gb >= 24:
             cache_batch_size = 8
-        else:
+        elif total_vram_gb >= 16:
             cache_batch_size = 4
+        else:
+            cache_batch_size = 2
 
-        # Auto training batch size for Action Expert
+        # Auto training batch size for Action Expert (very lightweight)
         if user_batch_size is not None and user_batch_size > 0:
             batch_size = user_batch_size
         else:
