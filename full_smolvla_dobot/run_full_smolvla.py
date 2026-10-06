@@ -5,12 +5,23 @@ import torch
 import numpy as np
 import pygame
 from PIL import Image
+import argparse
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "env"))
 sys.path.append(os.path.dirname(__file__))
 from dobot_env import DobotPickPlaceSim, COLOR_PALETTE
 from full_smolvla_model import FullSmolVLAPolicy
 from train_full_smolvla import MODEL_DIR, DEVICE
+
+# -------------------------------------------------------------------
+# Global command‑line arguments
+# -------------------------------------------------------------------
+parser = argparse.ArgumentParser(description="Run Full SmolVLA inference with optional horizon disabling.")
+parser.add_argument("--fast", action="store_true", help="Launch in fast lightspeed mode.")
+parser.add_argument("--no-horizon", action="store_true",
+                    help="Disable periodic replanning – the policy will generate a single trajectory and follow it to the end.")
+args = parser.parse_args()
+
 
 def run_full_smolvla(fast_mode=False):
     device = DEVICE
@@ -128,13 +139,14 @@ def run_full_smolvla(fast_mode=False):
                         episode_total_ticks = 0
                 else:
                     episode_total_ticks += 1
-                    
-                    # Allow disabling the periodic replanning horizon
-                    # If REPLAN_INTERVAL is set (e.g. 9999) the policy will run a single uninterrupted trajectory.
-                    # Otherwise we fall back to the original 8‑step (CUDA) / 64‑step (CPU) schedule.
-                    replan_interval = int(os.getenv("REPLAN_INTERVAL", str(8 if device.type == "cuda" else 64)))
+
+                    # Horizon / replanning logic (controlled by --no-horizon flag or REPLAN_INTERVAL env var)
+                    if args.no_horizon:
+                        replan_interval = 10**6
+                    else:
+                        replan_interval = int(os.getenv("REPLAN_INTERVAL", str(8 if device.type == "cuda" else 64)))
                     need_replan = (current_trajectory is None) or (traj_step >= replan_interval)
-                    
+
                     if need_replan:
                         with torch.no_grad():
                             img_chw = obs["image"]
@@ -299,8 +311,4 @@ def run_full_smolvla(fast_mode=False):
     pygame.quit()
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--fast", action="store_true", help="Launch in fast lightspeed mode")
-    args = parser.parse_args()
     run_full_smolvla(fast_mode=args.fast)
