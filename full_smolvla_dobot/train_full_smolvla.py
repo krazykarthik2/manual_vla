@@ -83,16 +83,18 @@ def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, use
         else:
             cache_batch_size = 2
 
-        # Auto training batch size for Action Expert (very lightweight)
+        # Auto training batch size for Action Expert (very lightweight — no VLM in training loop)
         if user_batch_size is not None and user_batch_size > 0:
             batch_size = user_batch_size
         else:
-            if total_vram_gb >= 24:
-                batch_size = 64
+            if total_vram_gb >= 40:
+                batch_size = 512
+            elif total_vram_gb >= 24:
+                batch_size = 256
             elif total_vram_gb >= 16:
-                batch_size = 32
+                batch_size = 128
             else:
-                batch_size = 16
+                batch_size = 64
 
         hw_summary = (
             f"Hardware: {num_gpus}x {gpu_name} ({total_vram_gb:.1f} GB VRAM each) | {cpu_cores} CPU cores\n"
