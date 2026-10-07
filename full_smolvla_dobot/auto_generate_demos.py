@@ -68,7 +68,9 @@ def generate_single_demo(demo_idx):
     pygame.init()
     
     sim = DobotPickPlaceSim()
-    act_choice = str(np.random.choice(["pick_place", "push"]))
+    # Force 100% pick_place tasks since this is what we evaluate on.
+    # Training on Push corrupted the grip behaviour.
+    act_choice = "pick_place"
     obs_dict = sim.reset(random_scene=True, num_distractors=2, action_type=act_choice)
     
     target_start = sim.target_cube_pos.copy()
@@ -144,7 +146,11 @@ def generate_single_demo(demo_idx):
             action_list.append(action_vec)
             sim.step_delta(action_vec)
 
-    if len(action_list) > 15:
+    # Verify the task actually succeeded before saving!
+    final_cube_dist_to_plat = np.linalg.norm(sim.target_cube_pos[:2] - sim.target_platform_pos[:2])
+    task_success = (final_cube_dist_to_plat < 0.040 and sim.target_cube_pos[2] <= 0.025 and not sim.gripper_closed)
+
+    if task_success and len(action_list) > 15:
         save_path = os.path.join(DATA_DIR, f"demo_{demo_idx:06d}.npz")
         np.savez_compressed(
             save_path,
