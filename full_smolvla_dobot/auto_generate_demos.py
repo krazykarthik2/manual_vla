@@ -3,8 +3,13 @@ import sys
 import time
 import math
 import numpy as np
-import pygame
 import concurrent.futures
+
+# Headless Pygame Settings (must be set before pygame is imported/initialized)
+os.environ["SDL_VIDEODRIVER"] = "dummy"
+os.environ["SDL_AUDIODRIVER"] = "dummy"
+
+import pygame
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "env"))
 from dobot_env import DobotPickPlaceSim
@@ -63,8 +68,6 @@ def get_augmented_prompt(action, target_color, target_plat_color):
     return str(np.random.choice(prompts))
 
 def generate_single_demo(demo_idx):
-    # Headless pygame
-    os.environ["SDL_VIDEODRIVER"] = "dummy"
     pygame.init()
     
     sim = DobotPickPlaceSim()
