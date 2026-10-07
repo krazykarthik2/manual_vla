@@ -163,47 +163,52 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, shards_d
     try:
         policy = FullSmolVLAPolicy(d_action_model=256, load_backbone=True, device=target_device)
 
-        for i in range(0, len(indexed_files), cache_batch_size):
-            chunk = indexed_files[i:i + cache_batch_size]
-            batch_imgs = []
-            batch_prompts = []
-            orig_indices = []
-            selected_ts = []
+        import concurrent.futures
 
-            for idx, f in chunk:
+        def load_batch(chunk):
+            b_orig_indices = []
+            b_selected_ts = []
+            b_batch_imgs = []
+            b_batch_prompts = []
+            for orig_idx, f in chunk:
                 d = np.load(f, allow_pickle=True)
-                actions = d['actions']
-                
-                # Always use t=0: cache the initial observation image and full trajectory.
-                # Random temporal slicing with a frozen cache caused catastrophic training failure
-                # because each demo was locked to a single random slice for all 200 epochs,
-                # and padding drowned the real action signal.
-                t = 0
-                
-                img_chw = d['images'][t]
-                img_hwc = (np.transpose(img_chw, (1, 2, 0)) * 255).astype(np.uint8)
-                batch_imgs.append(Image.fromarray(img_hwc))
-                batch_prompts.append(str(d['prompt'][0]))
-                orig_indices.append(idx)
-                selected_ts.append(t)
+                t = 0  # Always t=0 to prevent covariate shift
+                img_hwc = (np.transpose(d['images'][t], (1, 2, 0)) * 255).astype(np.uint8)
+                b_orig_indices.append(orig_idx)
+                b_selected_ts.append(t)
+                b_batch_imgs.append(Image.fromarray(img_hwc))
+                b_batch_prompts.append(str(d['prompt'][0]))
+            return b_orig_indices, b_selected_ts, b_batch_imgs, b_batch_prompts
 
-            with torch.no_grad():
-                raw_h = policy.extract_smolvlm_context(batch_imgs, batch_prompts, return_raw_hidden=True)
+        chunks = [indexed_files[i:i + cache_batch_size] for i in range(0, len(indexed_files), cache_batch_size)]
 
-            batch_results = []
-            for j, orig_idx in enumerate(orig_indices):
-                batch_results.append((orig_idx, selected_ts[j], raw_h[j].half().cpu()))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            # Prefetch the very first batch
+            future = executor.submit(load_batch, chunks[0]) if chunks else None
 
-            # Incrementally save batch shard to disk immediately
-            chunk_file = os.path.join(shards_dir, f"shard_{orig_indices[0]:06d}_{orig_indices[-1]:06d}.pt")
-            tmp_chunk_file = chunk_file + ".tmp"
-            torch.save(batch_results, tmp_chunk_file)
-            os.replace(tmp_chunk_file, chunk_file)
+            for i, chunk in enumerate(chunks):
+                # Wait for current batch to finish loading from disk
+                orig_indices, selected_ts, batch_imgs, batch_prompts = future.result()
 
-            progress_queue.put(len(chunk))
+                # Immediately trigger disk I/O for the NEXT batch in the background
+                if i + 1 < len(chunks):
+                    future = executor.submit(load_batch, chunks[i + 1])
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                # GPU Execution (happens simultaneously with next batch loading)
+                with torch.no_grad():
+                    raw_h = policy.extract_smolvlm_context(batch_imgs, batch_prompts, return_raw_hidden=True)
+
+                # CPU formatting and Disk Write
+                batch_results = []
+                for j, orig_idx in enumerate(orig_indices):
+                    batch_results.append((orig_idx, selected_ts[j], raw_h[j].half().cpu()))
+
+                chunk_file = os.path.join(shards_dir, f"shard_{orig_indices[0]:06d}_{orig_indices[-1]:06d}.pt")
+                tmp_chunk_file = chunk_file + ".tmp"
+                torch.save(batch_results, tmp_chunk_file)
+                os.replace(tmp_chunk_file, chunk_file)
+
+                progress_queue.put(len(chunk))
 
         del policy
         if torch.cuda.is_available():
