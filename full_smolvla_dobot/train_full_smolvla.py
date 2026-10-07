@@ -334,7 +334,8 @@ class FastFullSmolVLADataset(Dataset):
         if not files:
             print(">> No demonstrations found. Auto-generating 100 clean demonstrations...", flush=True)
             import subprocess
-            subprocess.run([sys.executable, "auto_generate_demos.py", "--num_demos", "100"], check=True)
+            generator_path = os.path.join(os.path.dirname(__file__), "auto_generate_demos.py")
+            subprocess.run([sys.executable, generator_path, "--num_demos", "100"], check=True)
             files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
 
         # run_parallel_caching intelligently resumes or builds missing shards
