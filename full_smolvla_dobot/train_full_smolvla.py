@@ -322,7 +322,7 @@ class FastFullSmolVLADataset(Dataset):
     """
     High-Performance Dataset with Auto-Tuned Multi-GPU / Multi-Worker Parallel Pre-Computed Features.
     """
-    def __init__(self, data_dir, cache_file=CACHE_FILE, force_recache=False, num_workers=None, workers_per_gpu=None, cache_batch_size=None):
+    def __init__(self, data_dir, cache_file=CACHE_FILE, force_recache=False, num_workers=None, workers_per_gpu=None, cache_batch_size=None, demosize=100):
         if force_recache:
             for sf in glob.glob(os.path.join(SHARDS_DIR, "shard_*.pt")):
                 try:
@@ -332,10 +332,10 @@ class FastFullSmolVLADataset(Dataset):
 
         files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
         if not files:
-            print(">> No demonstrations found. Auto-generating 100 clean demonstrations...", flush=True)
+            print(f">> No demonstrations found. Auto-generating {demosize} clean demonstrations...", flush=True)
             import subprocess
             generator_path = os.path.join(os.path.dirname(__file__), "auto_generate_demos.py")
-            subprocess.run([sys.executable, generator_path, "--num_demos", "100"], check=True)
+            subprocess.run([sys.executable, generator_path, "--num_demos", str(demosize)], check=True)
             files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
 
         # run_parallel_caching intelligently resumes or builds missing shards
@@ -415,7 +415,7 @@ def pad_collate_fn(batch):
     trajs = torch.stack(traj_list)
     return padded_raw, proprios, trajs
 
-def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_workers=None, workers_per_gpu=None):
+def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_workers=None, workers_per_gpu=None, demosize=100):
     hw = auto_detect_hardware_config(
         user_batch_size=batch_size,
         user_num_workers=num_workers,
@@ -439,7 +439,8 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
         force_recache=force_recache,
         num_workers=num_workers,
         workers_per_gpu=workers_per_gpu,
-        cache_batch_size=hw["cache_batch_size"]
+        cache_batch_size=hw["cache_batch_size"],
+        demosize=demosize
     )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=pad_collate_fn)
 
@@ -524,6 +525,7 @@ if __name__ == "__main__":
     parser.add_argument("--recache", action="store_true", help="Force re-compute the SmolVLM multi-layer features")
     parser.add_argument("--num-workers", type=int, default=None, help="Total caching workers (default: auto-detected)")
     parser.add_argument("--workers-per-gpu", type=int, default=None, help="Workers per GPU (default: auto-detected)")
+    parser.add_argument("--demosize", type=int, default=100, help="Number of demos to auto-generate if missing (default: 100)")
     args, unknown = parser.parse_known_args()
 
     if len(unknown) > 0 and unknown[0].isdigit():
@@ -535,5 +537,6 @@ if __name__ == "__main__":
         lr=args.lr,
         force_recache=args.recache,
         num_workers=args.num_workers,
-        workers_per_gpu=args.workers_per_gpu
+        workers_per_gpu=args.workers_per_gpu,
+        demosize=args.demosize
     )
