@@ -18,7 +18,7 @@ from train_full_smolvla import MODEL_DIR, DEVICE
 # -------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="Run Full SmolVLA inference with optional horizon disabling.")
 parser.add_argument("--fast", action="store_true", help="Launch in fast lightspeed mode.")
-parser.add_argument("--no-horizon", action="store_true",
+parser.add_argument("--no-horizon", action="store_true", default=True,
                     help="Disable periodic replanning – the policy will generate a single trajectory and follow it to the end.")
 args = parser.parse_args()
 
@@ -188,6 +188,9 @@ def run_full_smolvla(fast_mode=False):
                         advance_threshold = 0.012 if lightspeed else 0.008
                         if dist_to_pt < advance_threshold:
                             traj_step += 2 if lightspeed else 1
+                            if traj_step < len(current_trajectory):
+                                target_point = current_trajectory[traj_step]
+                                diff_xyz = target_point[:3] - sim.ee_pos[:3]
                         else:
                             traj_step += 2 if lightspeed else 1
 

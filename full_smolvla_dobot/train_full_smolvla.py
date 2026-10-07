@@ -380,15 +380,11 @@ class FastFullSmolVLADataset(Dataset):
 
             raw_traj = np.concatenate([proprio[t:, :3], acts[t:, 4:5]], axis=-1)
             
-            # Pad the trajectory up to 128 steps by repeating the final state. 
-            # This teaches the robot to hold steady after completing the task.
-            pad_len = 128 - len(raw_traj)
-            if pad_len > 0:
-                final_state = raw_traj[-1:]
-                padding = np.repeat(final_state, pad_len, axis=0)
-                raw_traj = np.concatenate([raw_traj, padding], axis=0)
-            elif pad_len < 0:
-                raw_traj = raw_traj[:128]
+            # Subagent Analysis Fix: Resample trajectory to exactly 128 smooth steps.
+            # Previously, padding to 128 caused 60-85% of loss gradients to penalize motion.
+            orig_len = len(raw_traj)
+            indices = np.linspace(0, orig_len - 1, 128).astype(int)
+            raw_traj = raw_traj[indices]
 
             norm_traj = (torch.tensor(raw_traj, dtype=torch.float32) - ACTION_MEAN) / (ACTION_STD + 1e-6)
             proprio_t = torch.tensor(proprio[t], dtype=torch.float32)
