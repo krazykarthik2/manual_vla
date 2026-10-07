@@ -173,9 +173,11 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, shards_d
                 d = np.load(f, allow_pickle=True)
                 actions = d['actions']
                 
-                # Covariate Shift Fix: Randomly slice the demonstration to train mid-task recovery
-                max_t = max(0, len(actions) - 16)
-                t = int(np.random.randint(0, max_t + 1))
+                # Always use t=0: cache the initial observation image and full trajectory.
+                # Random temporal slicing with a frozen cache caused catastrophic training failure
+                # because each demo was locked to a single random slice for all 200 epochs,
+                # and padding drowned the real action signal.
+                t = 0
                 
                 img_chw = d['images'][t]
                 img_hwc = (np.transpose(img_chw, (1, 2, 0)) * 255).astype(np.uint8)
