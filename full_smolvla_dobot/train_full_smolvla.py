@@ -72,16 +72,15 @@ def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, use
         else:
             num_workers = num_gpus * workers_per_gpu
 
-        # Auto scale cache batch size based on VRAM (128x128 images take extreme attention memory)
-        # We heavily throttle this to absolutely guarantee no out-of-memory errors.
+        # Auto scale cache batch size based on VRAM (SmolVLM-256M is lightweight at ~300MB in bfloat16)
         if total_vram_gb >= 40:
-            cache_batch_size = 16
+            cache_batch_size = 32
         elif total_vram_gb >= 24:
-            cache_batch_size = 8
+            cache_batch_size = 16
         elif total_vram_gb >= 16:
-            cache_batch_size = 4
+            cache_batch_size = 8
         else:
-            cache_batch_size = 2
+            cache_batch_size = 4
 
         # Auto training batch size for Action Expert (very lightweight — no VLM in training loop)
         if user_batch_size is not None and user_batch_size > 0:
