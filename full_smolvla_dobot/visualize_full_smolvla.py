@@ -17,7 +17,7 @@ def visualize_full_smolvla():
     model_path = os.path.join(MODEL_DIR, "dobot_full_smolvla_policy.pth")
 
     print("[Visualizer] Initializing Full SmolVLA with foundation SmolVLM backbone...", flush=True)
-    model = FullSmolVLAPolicy(d_action_model=512, load_backbone=True, device=device).to(device)
+    model = FullSmolVLAPolicy(load_backbone=True, device=device).to(device)
 
     has_trained_weights = False
     if os.path.exists(model_path):

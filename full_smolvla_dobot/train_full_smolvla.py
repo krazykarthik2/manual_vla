@@ -161,7 +161,7 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, shards_d
         target_device = "cpu"
 
     try:
-        policy = FullSmolVLAPolicy(d_action_model=512, load_backbone=True, device=target_device)
+        policy = FullSmolVLAPolicy(load_backbone=True, device=target_device)
 
         import concurrent.futures
 
@@ -451,7 +451,7 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
     )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=pad_collate_fn)
 
-    policy = FullSmolVLAPolicy(d_action_model=512, load_backbone=False, device=DEVICE).to(DEVICE)
+    policy = FullSmolVLAPolicy(load_backbone=False, device=DEVICE).to(DEVICE)
     if torch.cuda.device_count() > 1:
         print(f"[INFO] Using {torch.cuda.device_count()} GPUs for parallel policy training!", flush=True)
         policy = nn.DataParallel(policy)
