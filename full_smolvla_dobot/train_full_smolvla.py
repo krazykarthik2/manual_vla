@@ -452,6 +452,9 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=pad_collate_fn)
 
     policy = FullSmolVLAPolicy(d_action_model=512, load_backbone=False, device=DEVICE).to(DEVICE)
+    if torch.cuda.device_count() > 1:
+        print(f"[INFO] Using {torch.cuda.device_count()} GPUs for parallel policy training!", flush=True)
+        policy = nn.DataParallel(policy)
     policy.train()
 
     trainable_params = [p for p in policy.parameters() if p.requires_grad]
@@ -478,8 +481,6 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
                 B = raw_hidden.size(0)
                 optimizer.zero_grad(set_to_none=True)
 
-                vlm_tokens = policy.vlm_proj(raw_hidden)
-
                 # ---- DATA AUGMENTATION (COVARIATE SHIFT FIX) ----
                 # Inject a small random uniform noise (±1.5cm) into the starting proprioceptive state.
                 # This teaches the model how to correct its path when it inevitably drifts slightly 
@@ -494,7 +495,8 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
                 x_t = (1.0 - t_expanded) * x_0 + t_expanded * x_1
                 u_t = x_1 - x_0
 
-                v_pred = policy.forward_from_embeddings(x_t, t, vlm_tokens, proprio=proprio)
+                # DataParallel splits the batch and handles vlm_proj + forward_from_embeddings
+                v_pred = policy(raw_hidden, proprio, x_t, t)
 
                 loss_raw = loss_fn(v_pred, u_t)
                 dim_weights = torch.tensor([1.2, 1.2, 1.5, 2.5], device=DEVICE).view(1, 1, 4)
@@ -509,7 +511,9 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
 
             if avg_loss < best_loss or epoch % 10 == 0:
                 best_loss = min(best_loss, avg_loss)
-                filtered = {k: v for k, v in policy.state_dict().items() if not k.startswith("smolvlm.")}
+                # Unwrap DataParallel before saving
+                model_to_save = policy.module if isinstance(policy, nn.DataParallel) else policy
+                filtered = {k: v for k, v in model_to_save.state_dict().items() if not k.startswith("smolvlm.")}
                 safe_save_model(filtered, model_path)
 
             current_lr = scheduler.get_last_lr()[0]

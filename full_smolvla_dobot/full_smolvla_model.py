@@ -158,6 +158,11 @@ class FullSmolVLAPolicy(nn.Module):
         vlm_tokens = self.vlm_proj(multi_layer_hidden) # [B, seq_len, d_action_model]
         return vlm_tokens
 
+    def forward(self, raw_hidden, proprio, x_t, t):
+        """Standard forward pass for DataParallel training."""
+        vlm_tokens = self.vlm_proj(raw_hidden)
+        return self.forward_from_embeddings(x_t, t, vlm_tokens, proprio=proprio)
+
     def forward_from_embeddings(self, x_t, t, vlm_tokens, proprio=None, return_activations=False):
         """
         Action generation conditioned on cached or extracted SmolVLM tokens.
