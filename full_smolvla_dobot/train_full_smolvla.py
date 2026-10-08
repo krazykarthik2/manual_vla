@@ -371,29 +371,35 @@ class FastFullSmolVLADataset(Dataset):
         cached_raw = [all_results[i] for i in range(len(files))]
 
         self.samples = []
+        all_raw_trajs = []
+        
+        # Pass 1: Compute true dataset normalization statistics
         for idx, f in enumerate(files):
             d = np.load(f, allow_pickle=True)
             proprio = d['proprioception'].astype(np.float32)
             acts = d['actions'].astype(np.float32)
-
             t, vlm_tensor = cached_raw[idx]
-
             raw_traj = np.concatenate([proprio[t:, :3], acts[t:, 4:5]], axis=-1)
-            
-            # Subagent Analysis Fix: Resample trajectory to exactly 128 smooth steps.
-            # Previously, padding to 128 caused 60-85% of loss gradients to penalize motion.
             orig_len = len(raw_traj)
             indices = np.linspace(0, orig_len - 1, 128).astype(int)
             raw_traj = raw_traj[indices]
+            all_raw_trajs.append((vlm_tensor, torch.tensor(proprio[t], dtype=torch.float32), raw_traj))
 
-            norm_traj = (torch.tensor(raw_traj, dtype=torch.float32) - ACTION_MEAN) / (ACTION_STD + 1e-6)
-            proprio_t = torch.tensor(proprio[t], dtype=torch.float32)
+        # Dynamically calculate Mean and Std
+        concat_trajs = np.concatenate([rt for _, _, rt in all_raw_trajs], axis=0)
+        action_mean = torch.tensor(np.mean(concat_trajs, axis=0), dtype=torch.float32)
+        action_std = torch.tensor(np.std(concat_trajs, axis=0), dtype=torch.float32)
+        
+        # Save for inference script
+        stats_path = os.path.join(os.path.dirname(data_dir), "models", "dobot_full_smolvla_policy_stats.pt")
+        os.makedirs(os.path.dirname(stats_path), exist_ok=True)
+        torch.save({"mean": action_mean, "std": action_std}, stats_path)
+        print(f">> Dynamic Action Stats Computed & Saved: Mean={action_mean.tolist()}, Std={action_std.tolist()}", flush=True)
 
-            self.samples.append((
-                vlm_tensor,
-                proprio_t,
-                norm_traj
-            ))
+        # Pass 2: Normalize with dynamic stats
+        for vlm_tensor, proprio_t, raw_traj in all_raw_trajs:
+            norm_traj = (torch.tensor(raw_traj, dtype=torch.float32) - action_mean) / (action_std + 1e-6)
+            self.samples.append((vlm_tensor, proprio_t, norm_traj))
 
         print(f">> Ready! Loaded {len(self.samples)} demonstrations into memory.", flush=True)
 

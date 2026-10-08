@@ -224,8 +224,14 @@ class FullSmolVLAPolicy(nn.Module):
         B = len(images_pil)
         vlm_tokens = self.extract_smolvlm_context(images_pil, prompt_texts)
 
-        ACTION_MEAN = torch.tensor([0.2028, 0.0008, 0.0854, 0.5360], dtype=torch.float32, device=self.device)
-        ACTION_STD  = torch.tensor([0.0330, 0.0837, 0.0362, 0.4987], dtype=torch.float32, device=self.device)
+        stats_path = os.path.join(os.path.dirname(__file__), "models", "dobot_full_smolvla_policy_stats.pt")
+        if os.path.exists(stats_path):
+            stats = torch.load(stats_path, map_location=self.device)
+            ACTION_MEAN = stats["mean"].to(self.device)
+            ACTION_STD = stats["std"].to(self.device)
+        else:
+            ACTION_MEAN = torch.tensor([0.2028, 0.0008, 0.0854, 0.5360], dtype=torch.float32, device=self.device)
+            ACTION_STD  = torch.tensor([0.0330, 0.0837, 0.0362, 0.4987], dtype=torch.float32, device=self.device)
 
         x = torch.randn(B, self.horizon, self.action_dim, device=self.device)
         dt = 1.0 / num_steps
