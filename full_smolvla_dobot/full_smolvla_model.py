@@ -34,7 +34,7 @@ class FullSmolVLAPolicy(nn.Module):
     - Continuous Sinusoidal Diffusion Time + Proprioception Conditioning
     - Multimodal Cross-Attention Action Decoder Head over Horizon H=128 for 4D actions (x, y, z, grip)
     """
-    def __init__(self, d_action_model=256, horizon=128, action_dim=4, freeze_backbone=True, load_backbone=True, smolvlm_hidden_dim=576, device='cpu'):
+    def __init__(self, d_action_model=512, horizon=128, action_dim=4, freeze_backbone=True, load_backbone=True, smolvlm_hidden_dim=576, device='cpu'):
         super().__init__()
         self.horizon = horizon
         self.action_dim = action_dim
@@ -96,26 +96,26 @@ class FullSmolVLAPolicy(nn.Module):
         self.action_in_proj = nn.Linear(action_dim, d_action_model)
         self.pos_queries = nn.Parameter(torch.randn(1, horizon, d_action_model) * 0.02)
 
-        self.dec_sa1 = nn.MultiheadAttention(d_action_model, 4, batch_first=True)
-        self.dec_ca1 = nn.MultiheadAttention(d_action_model, 4, batch_first=True)
+        self.dec_sa1 = nn.MultiheadAttention(d_action_model, 8, batch_first=True)
+        self.dec_ca1 = nn.MultiheadAttention(d_action_model, 8, batch_first=True)
         self.dec_n1 = nn.LayerNorm(d_action_model)
         self.dec_n2 = nn.LayerNorm(d_action_model)
         self.dec_n3 = nn.LayerNorm(d_action_model)
         self.dec_ffn1 = nn.Sequential(
-            nn.Linear(d_action_model, d_action_model * 2),
+            nn.Linear(d_action_model, d_action_model * 4),
             nn.GELU(),
-            nn.Linear(d_action_model * 2, d_action_model)
+            nn.Linear(d_action_model * 4, d_action_model)
         )
 
-        self.dec_sa2 = nn.MultiheadAttention(d_action_model, 4, batch_first=True)
-        self.dec_ca2 = nn.MultiheadAttention(d_action_model, 4, batch_first=True)
+        self.dec_sa2 = nn.MultiheadAttention(d_action_model, 8, batch_first=True)
+        self.dec_ca2 = nn.MultiheadAttention(d_action_model, 8, batch_first=True)
         self.dec_n4 = nn.LayerNorm(d_action_model)
         self.dec_n5 = nn.LayerNorm(d_action_model)
         self.dec_n6 = nn.LayerNorm(d_action_model)
         self.dec_ffn2 = nn.Sequential(
-            nn.Linear(d_action_model, d_action_model * 2),
+            nn.Linear(d_action_model, d_action_model * 4),
             nn.GELU(),
-            nn.Linear(d_action_model * 2, d_action_model)
+            nn.Linear(d_action_model * 4, d_action_model)
         )
 
         self.out_head = nn.Sequential(

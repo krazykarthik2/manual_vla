@@ -161,7 +161,7 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, shards_d
         target_device = "cpu"
 
     try:
-        policy = FullSmolVLAPolicy(d_action_model=256, load_backbone=True, device=target_device)
+        policy = FullSmolVLAPolicy(d_action_model=512, load_backbone=True, device=target_device)
 
         import concurrent.futures
 
@@ -445,7 +445,7 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
     )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=pad_collate_fn)
 
-    policy = FullSmolVLAPolicy(d_action_model=256, load_backbone=False, device=DEVICE).to(DEVICE)
+    policy = FullSmolVLAPolicy(d_action_model=512, load_backbone=False, device=DEVICE).to(DEVICE)
     policy.train()
 
     trainable_params = [p for p in policy.parameters() if p.requires_grad]
@@ -473,6 +473,13 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
                 optimizer.zero_grad(set_to_none=True)
 
                 vlm_tokens = policy.vlm_proj(raw_hidden)
+
+                # ---- DATA AUGMENTATION (COVARIATE SHIFT FIX) ----
+                # Inject a small random uniform noise (±1.5cm) into the starting proprioceptive state.
+                # This teaches the model how to correct its path when it inevitably drifts slightly 
+                # off-course during real open-loop execution.
+                proprio_noise = (torch.rand_like(proprio) * 2 - 1) * 0.015 
+                proprio = proprio + proprio_noise
 
                 x_0 = torch.randn_like(x_1)
                 t = torch.rand(B, device=DEVICE)
