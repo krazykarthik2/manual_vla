@@ -30,8 +30,11 @@ from full_smolvla_model import FullSmolVLAPolicy
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if DEVICE.type == "cpu":
     NUM_CORES = os.cpu_count() or 4
-    torch.set_num_threads(NUM_CORES)
-    torch.set_num_interop_threads(NUM_CORES)
+    try:
+        torch.set_num_threads(NUM_CORES)
+        torch.set_num_interop_threads(NUM_CORES)
+    except:
+        pass
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "demonstrations")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
@@ -57,7 +60,8 @@ def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, use
             total_vram_gb = 16.0
             gpu_name = "CUDA GPU"
 
-        # 1 dedicated worker per GPU is cleanest & fastest without VRAM contention
+        # Single worker per GPU is mathematically safest. PyTorch multi-processing
+        # fragments CUDA allocators causing fatal overlapping VRAM spikes.
         if user_workers_per_gpu is not None and user_workers_per_gpu > 0:
             workers_per_gpu = user_workers_per_gpu
         else:
@@ -68,13 +72,28 @@ def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, use
         else:
             num_workers = num_gpus * workers_per_gpu
 
-        cache_batch_size = 16
+        # Auto scale cache batch size based on VRAM (SmolVLM-256M is lightweight at ~300MB in bfloat16)
+        if total_vram_gb >= 40:
+            cache_batch_size = 32
+        elif total_vram_gb >= 24:
+            cache_batch_size = 16
+        elif total_vram_gb >= 16:
+            cache_batch_size = 8
+        else:
+            cache_batch_size = 4
 
-        # Auto training batch size for Action Expert (712k parameters)
+        # Auto training batch size for Action Expert (very lightweight — no VLM in training loop)
         if user_batch_size is not None and user_batch_size > 0:
             batch_size = user_batch_size
         else:
-            batch_size = 64 if total_vram_gb >= 20 else 32
+            if total_vram_gb >= 40:
+                batch_size = 512
+            elif total_vram_gb >= 24:
+                batch_size = 256
+            elif total_vram_gb >= 16:
+                batch_size = 128
+            else:
+                batch_size = 64
 
         hw_summary = (
             f"Hardware: {num_gpus}x {gpu_name} ({total_vram_gb:.1f} GB VRAM each) | {cpu_cores} CPU cores\n"
@@ -142,39 +161,54 @@ def _caching_worker(worker_id, gpu_id, indexed_files, cache_batch_size, shards_d
         target_device = "cpu"
 
     try:
-        policy = FullSmolVLAPolicy(d_action_model=128, load_backbone=True, device=target_device)
+        policy = FullSmolVLAPolicy(load_backbone=True, device=target_device)
 
-        for i in range(0, len(indexed_files), cache_batch_size):
-            chunk = indexed_files[i:i + cache_batch_size]
-            batch_imgs = []
-            batch_prompts = []
-            orig_indices = []
+        import concurrent.futures
 
-            for idx, f in chunk:
+        def load_batch(chunk):
+            b_orig_indices = []
+            b_selected_ts = []
+            b_batch_imgs = []
+            b_batch_prompts = []
+            for orig_idx, f in chunk:
                 d = np.load(f, allow_pickle=True)
-                img_chw = d['images'][0] # [3, 64, 64]
-                img_hwc = (np.transpose(img_chw, (1, 2, 0)) * 255).astype(np.uint8)
-                batch_imgs.append(Image.fromarray(img_hwc))
-                batch_prompts.append(str(d['prompt'][0]))
-                orig_indices.append(idx)
+                t = 0  # Always t=0 to prevent covariate shift
+                img_hwc = (np.transpose(d['images'][t], (1, 2, 0)) * 255).astype(np.uint8)
+                b_orig_indices.append(orig_idx)
+                b_selected_ts.append(t)
+                b_batch_imgs.append(Image.fromarray(img_hwc))
+                b_batch_prompts.append(str(d['prompt'][0]))
+            return b_orig_indices, b_selected_ts, b_batch_imgs, b_batch_prompts
 
-            with torch.no_grad():
-                raw_h = policy.extract_smolvlm_context(batch_imgs, batch_prompts, return_raw_hidden=True)
+        chunks = [indexed_files[i:i + cache_batch_size] for i in range(0, len(indexed_files), cache_batch_size)]
 
-            batch_results = []
-            for j, orig_idx in enumerate(orig_indices):
-                batch_results.append((orig_idx, raw_h[j].float().cpu()))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            # Prefetch the very first batch
+            future = executor.submit(load_batch, chunks[0]) if chunks else None
 
-            # Incrementally save batch shard to disk immediately
-            chunk_file = os.path.join(shards_dir, f"shard_{orig_indices[0]:06d}_{orig_indices[-1]:06d}.pt")
-            tmp_chunk_file = chunk_file + ".tmp"
-            torch.save(batch_results, tmp_chunk_file)
-            os.replace(tmp_chunk_file, chunk_file)
+            for i, chunk in enumerate(chunks):
+                # Wait for current batch to finish loading from disk
+                orig_indices, selected_ts, batch_imgs, batch_prompts = future.result()
 
-            progress_queue.put(len(chunk))
+                # Immediately trigger disk I/O for the NEXT batch in the background
+                if i + 1 < len(chunks):
+                    future = executor.submit(load_batch, chunks[i + 1])
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                # GPU Execution (happens simultaneously with next batch loading)
+                with torch.no_grad():
+                    raw_h = policy.extract_smolvlm_context(batch_imgs, batch_prompts, return_raw_hidden=True)
+
+                # CPU formatting and Disk Write
+                batch_results = []
+                for j, orig_idx in enumerate(orig_indices):
+                    batch_results.append((orig_idx, selected_ts[j], raw_h[j].half().cpu()))
+
+                chunk_file = os.path.join(shards_dir, f"shard_{orig_indices[0]:06d}_{orig_indices[-1]:06d}.pt")
+                tmp_chunk_file = chunk_file + ".tmp"
+                torch.save(batch_results, tmp_chunk_file)
+                os.replace(tmp_chunk_file, chunk_file)
+
+                progress_queue.put(len(chunk))
 
         del policy
         if torch.cuda.is_available():
@@ -210,7 +244,11 @@ def run_parallel_caching(files, cache_file, shards_dir=SHARDS_DIR, num_workers=N
     for sf in existing_shard_files:
         try:
             items = torch.load(sf, map_location="cpu")
-            for orig_idx, tensor in items:
+            for item in items:
+                if len(item) == 3:
+                    orig_idx, t, tensor = item
+                else:
+                    orig_idx, tensor = item
                 existing_cached_items[orig_idx] = tensor
         except Exception:
             pass
@@ -271,7 +309,11 @@ def run_parallel_caching(files, cache_file, shards_dir=SHARDS_DIR, num_workers=N
     for sf in final_shard_files:
         try:
             items = torch.load(sf, map_location="cpu")
-            for orig_idx, tensor in items:
+            for item in items:
+                if len(item) == 3:
+                    orig_idx, t, tensor = item
+                else:
+                    orig_idx, tensor = item
                 all_results[orig_idx] = tensor
         except Exception as e:
             print(f"[WARN] Corrupt shard file {sf}: {e}", flush=True)
@@ -279,90 +321,85 @@ def run_parallel_caching(files, cache_file, shards_dir=SHARDS_DIR, num_workers=N
     if len(all_results) != num_demos:
         raise RuntimeError(f"Parallel caching gathered {len(all_results)}/{num_demos} items. Some workers may have failed.")
 
-    # Sort in exact demonstration order
-    cached_raw_hidden = [all_results[i] for i in range(num_demos)]
-
-    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-    torch.save({
-        'version': CACHE_VERSION,
-        'files': files,
-        'raw_hidden': cached_raw_hidden
-    }, cache_file)
-    print(f">> [DONE] Master SmolVLM cache assembled and saved -> {cache_file}", flush=True)
-
-    # Clean up intermediate shard files
-    for sf in final_shard_files:
-        try:
-            os.remove(sf)
-        except OSError:
-            pass
+    print(f">> [DONE] Master SmolVLM cache successfully extracted and distributed across chunk shards in {shards_dir}", flush=True)
 
 class FastFullSmolVLADataset(Dataset):
     """
     High-Performance Dataset with Auto-Tuned Multi-GPU / Multi-Worker Parallel Pre-Computed Features.
     """
-    def __init__(self, data_dir, cache_file=CACHE_FILE, force_recache=False, num_workers=None, workers_per_gpu=None, cache_batch_size=None):
-        valid_cache = False
-        if os.path.exists(cache_file) and not force_recache:
-            try:
-                print(f">> Checking SmolVLM cache at {cache_file}...", flush=True)
-                cache = torch.load(cache_file, map_location="cpu")
-                if isinstance(cache, dict) and cache.get("version") == CACHE_VERSION and "raw_hidden" in cache:
-                    valid_cache = True
-                else:
-                    print(">> Cache version mismatch or legacy format. Regenerating cache...", flush=True)
-            except Exception as e:
-                print(f">> Cache file corrupted ({e}). Regenerating cache...", flush=True)
-
-        if not valid_cache:
-            if os.path.exists(cache_file) and force_recache:
+    def __init__(self, data_dir, cache_file=CACHE_FILE, force_recache=False, num_workers=None, workers_per_gpu=None, cache_batch_size=None, demosize=100):
+        if force_recache:
+            for sf in glob.glob(os.path.join(SHARDS_DIR, "shard_*.pt")):
                 try:
-                    os.remove(cache_file)
+                    os.remove(sf)
                 except OSError:
                     pass
-                # Also clean shards if forced recache
-                for sf in glob.glob(os.path.join(SHARDS_DIR, "shard_*.pt")):
-                    try:
-                        os.remove(sf)
-                    except OSError:
-                        pass
 
+        files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
+        if not files:
+            print(f">> No demonstrations found. Auto-generating {demosize} clean demonstrations...", flush=True)
+            import subprocess
+            generator_path = os.path.join(os.path.dirname(__file__), "auto_generate_demos.py")
+            subprocess.run([sys.executable, generator_path, "--num_demos", str(demosize)], check=True)
             files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
-            if not files:
-                print(">> No demonstrations found. Auto-generating 100 clean demonstrations...", flush=True)
-                from auto_generate_demos import run_auto_demonstrator
-                run_auto_demonstrator(num_demos=100)
-                files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
 
-            run_parallel_caching(
-                files=files,
-                cache_file=cache_file,
-                shards_dir=SHARDS_DIR,
-                num_workers=num_workers,
-                workers_per_gpu=workers_per_gpu,
-                cache_batch_size=cache_batch_size
-            )
+        # run_parallel_caching intelligently resumes or builds missing shards
+        run_parallel_caching(
+            files=files,
+            cache_file=cache_file,
+            shards_dir=SHARDS_DIR,
+            num_workers=num_workers,
+            workers_per_gpu=workers_per_gpu,
+            cache_batch_size=cache_batch_size
+        )
 
-        print(f">> Loading Precomputed SmolVLM multi-layer features into memory...", flush=True)
-        cache = torch.load(cache_file, map_location="cpu")
-        files = cache['files']
-        cached_raw = cache['raw_hidden']
+        print(f">> Loading Precomputed SmolVLM multi-layer features into memory directly from chunk shards...", flush=True)
+        all_results = {}
+        for sf in glob.glob(os.path.join(SHARDS_DIR, "shard_*.pt")):
+            try:
+                items = torch.load(sf, map_location="cpu")
+                for item in items:
+                    if len(item) == 3:
+                        orig_idx, t, tensor = item
+                    else:
+                        orig_idx, tensor = item
+                        t = 0
+                    all_results[orig_idx] = (t, tensor)
+            except Exception:
+                pass
+        
+        cached_raw = [all_results[i] for i in range(len(files))]
 
         self.samples = []
+        all_raw_trajs = []
+        
+        # Pass 1: Compute true dataset normalization statistics
         for idx, f in enumerate(files):
             d = np.load(f, allow_pickle=True)
             proprio = d['proprioception'].astype(np.float32)
             acts = d['actions'].astype(np.float32)
+            t, vlm_tensor = cached_raw[idx]
+            raw_traj = np.concatenate([proprio[t:, :3], acts[t:, 4:5]], axis=-1)
+            orig_len = len(raw_traj)
+            indices = np.linspace(0, orig_len - 1, 128).astype(int)
+            raw_traj = raw_traj[indices]
+            all_raw_trajs.append((vlm_tensor, torch.tensor(proprio[t], dtype=torch.float32), raw_traj))
 
-            raw_traj = np.concatenate([proprio[:, :3], acts[:, 4:5]], axis=-1)
-            norm_traj = (torch.tensor(raw_traj, dtype=torch.float32) - ACTION_MEAN) / (ACTION_STD + 1e-6)
-            proprio0 = torch.tensor(proprio[0], dtype=torch.float32)
+        # Dynamically calculate Mean and Std
+        concat_trajs = np.concatenate([rt for _, _, rt in all_raw_trajs], axis=0)
+        action_mean = torch.tensor(np.mean(concat_trajs, axis=0), dtype=torch.float32)
+        action_std = torch.tensor(np.std(concat_trajs, axis=0), dtype=torch.float32)
+        
+        # Save for inference script
+        stats_path = os.path.join(os.path.dirname(data_dir), "models", "dobot_full_smolvla_policy_stats.pt")
+        os.makedirs(os.path.dirname(stats_path), exist_ok=True)
+        torch.save({"mean": action_mean, "std": action_std}, stats_path)
+        print(f">> Dynamic Action Stats Computed & Saved: Mean={action_mean.tolist()}, Std={action_std.tolist()}", flush=True)
 
-            self.samples.append((
-                cached_raw[idx],
-                proprio0,
-                norm_traj
-            ))
+        # Pass 2: Normalize with dynamic stats
+        for vlm_tensor, proprio_t, raw_traj in all_raw_trajs:
+            norm_traj = (torch.tensor(raw_traj, dtype=torch.float32) - action_mean) / (action_std + 1e-6)
+            self.samples.append((vlm_tensor, proprio_t, norm_traj))
 
         print(f">> Ready! Loaded {len(self.samples)} demonstrations into memory.", flush=True)
 
@@ -385,7 +422,7 @@ def pad_collate_fn(batch):
     trajs = torch.stack(traj_list)
     return padded_raw, proprios, trajs
 
-def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_workers=None, workers_per_gpu=None):
+def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_workers=None, workers_per_gpu=None, demosize=100):
     hw = auto_detect_hardware_config(
         user_batch_size=batch_size,
         user_num_workers=num_workers,
@@ -409,11 +446,15 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
         force_recache=force_recache,
         num_workers=num_workers,
         workers_per_gpu=workers_per_gpu,
-        cache_batch_size=hw["cache_batch_size"]
+        cache_batch_size=hw["cache_batch_size"],
+        demosize=demosize
     )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=pad_collate_fn)
 
-    policy = FullSmolVLAPolicy(d_action_model=128, load_backbone=False, device=DEVICE).to(DEVICE)
+    policy = FullSmolVLAPolicy(load_backbone=False, device=DEVICE).to(DEVICE)
+    if torch.cuda.device_count() > 1:
+        print(f"[INFO] Using {torch.cuda.device_count()} GPUs for parallel policy training!", flush=True)
+        policy = nn.DataParallel(policy)
     policy.train()
 
     trainable_params = [p for p in policy.parameters() if p.requires_grad]
@@ -440,7 +481,12 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
                 B = raw_hidden.size(0)
                 optimizer.zero_grad(set_to_none=True)
 
-                vlm_tokens = policy.vlm_proj(raw_hidden)
+                # ---- DATA AUGMENTATION (COVARIATE SHIFT FIX) ----
+                # Inject a small random uniform noise (±1.5cm) into the starting proprioceptive state.
+                # This teaches the model how to correct its path when it inevitably drifts slightly 
+                # off-course during real open-loop execution.
+                proprio_noise = (torch.rand_like(proprio) * 2 - 1) * 0.015 
+                proprio = proprio + proprio_noise
 
                 x_0 = torch.randn_like(x_1)
                 t = torch.rand(B, device=DEVICE)
@@ -449,13 +495,15 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
                 x_t = (1.0 - t_expanded) * x_0 + t_expanded * x_1
                 u_t = x_1 - x_0
 
-                v_pred = policy.forward_from_embeddings(x_t, t, vlm_tokens, proprio=proprio)
+                # DataParallel splits the batch and handles vlm_proj + forward_from_embeddings
+                v_pred = policy(raw_hidden, proprio, x_t, t)
 
                 loss_raw = loss_fn(v_pred, u_t)
                 dim_weights = torch.tensor([1.2, 1.2, 1.5, 2.5], device=DEVICE).view(1, 1, 4)
                 flow_loss = (loss_raw * dim_weights).mean()
 
                 flow_loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
                 optimizer.step()
                 total_loss += flow_loss.item() * B
 
@@ -464,7 +512,9 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
 
             if avg_loss < best_loss or epoch % 10 == 0:
                 best_loss = min(best_loss, avg_loss)
-                filtered = {k: v for k, v in policy.state_dict().items() if not k.startswith("smolvlm.")}
+                # Unwrap DataParallel before saving
+                model_to_save = policy.module if isinstance(policy, nn.DataParallel) else policy
+                filtered = {k: v for k, v in model_to_save.state_dict().items() if not k.startswith("smolvlm.")}
                 safe_save_model(filtered, model_path)
 
             current_lr = scheduler.get_last_lr()[0]
@@ -494,6 +544,7 @@ if __name__ == "__main__":
     parser.add_argument("--recache", action="store_true", help="Force re-compute the SmolVLM multi-layer features")
     parser.add_argument("--num-workers", type=int, default=None, help="Total caching workers (default: auto-detected)")
     parser.add_argument("--workers-per-gpu", type=int, default=None, help="Workers per GPU (default: auto-detected)")
+    parser.add_argument("--demosize", type=int, default=100, help="Number of demos to auto-generate if missing (default: 100)")
     args, unknown = parser.parse_known_args()
 
     if len(unknown) > 0 and unknown[0].isdigit():
@@ -505,5 +556,6 @@ if __name__ == "__main__":
         lr=args.lr,
         force_recache=args.recache,
         num_workers=args.num_workers,
-        workers_per_gpu=args.workers_per_gpu
+        workers_per_gpu=args.workers_per_gpu,
+        demosize=args.demosize
     )

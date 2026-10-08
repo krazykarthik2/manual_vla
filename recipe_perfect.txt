@@ -1,0 +1,3 @@
+generate 2000 examples
+train 200 epochs
+then run it will be perfect 
