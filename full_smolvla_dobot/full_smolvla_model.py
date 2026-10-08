@@ -182,29 +182,36 @@ class FullSmolVLAPolicy(nn.Module):
         act_queries = self.action_in_proj(x_t) + self.pos_queries
 
         # Layer 1
-        sa_out, sa_w1 = self.dec_sa1(act_queries, act_queries, act_queries, need_weights=return_activations)
-        act_queries = self.dec_n1(act_queries + sa_out)
+        q1 = self.dec_n1(act_queries)
+        sa_out, sa_w1 = self.dec_sa1(q1, q1, q1, need_weights=return_activations)
+        act_queries = act_queries + sa_out
         l1_sa = act_queries
 
-        ca_out, ca_w1 = self.dec_ca1(act_queries, context, context, need_weights=True)
-        act_queries = self.dec_n2(act_queries + ca_out)
+        q2 = self.dec_n2(act_queries)
+        ca_out, ca_w1 = self.dec_ca1(q2, context, context, need_weights=True)
+        act_queries = act_queries + ca_out
         l1_ca = act_queries
 
-        act_queries = self.dec_n3(act_queries + self.dec_ffn1(act_queries))
+        q3 = self.dec_n3(act_queries)
+        act_queries = act_queries + self.dec_ffn1(q3)
         l1_out = act_queries
 
         # Layer 2
-        sa_out2, sa_w2 = self.dec_sa2(act_queries, act_queries, act_queries, need_weights=return_activations)
-        act_queries = self.dec_n4(act_queries + sa_out2)
+        q4 = self.dec_n4(act_queries)
+        sa_out2, sa_w2 = self.dec_sa2(q4, q4, q4, need_weights=return_activations)
+        act_queries = act_queries + sa_out2
         l2_sa = act_queries
 
-        ca_out2, ca_w2 = self.dec_ca2(act_queries, context, context, need_weights=True)
-        act_queries = self.dec_n5(act_queries + ca_out2)
+        q5 = self.dec_n5(act_queries)
+        ca_out2, ca_w2 = self.dec_ca2(q5, context, context, need_weights=True)
+        act_queries = act_queries + ca_out2
         l2_ca = act_queries
 
-        act_queries = self.dec_n6(act_queries + self.dec_ffn2(act_queries))
+        q6 = self.dec_n6(act_queries)
+        act_queries = act_queries + self.dec_ffn2(q6)
         l2_out = act_queries
 
+        # Final output projection (always requires a final layernorm in Pre-Norm architectures)
         v_pred = self.out_head(act_queries)
 
         if return_activations:
