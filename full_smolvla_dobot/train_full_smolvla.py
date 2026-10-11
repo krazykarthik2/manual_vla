@@ -244,12 +244,23 @@ def run_parallel_caching(files, cache_file, shards_dir=SHARDS_DIR, num_workers=N
     for sf in existing_shard_files:
         try:
             items = torch.load(sf, map_location="cpu")
+            shard_valid = True
             for item in items:
-                if len(item) == 3:
-                    orig_idx, t, tensor = item
-                else:
-                    orig_idx, tensor = item
-                existing_cached_items[orig_idx] = tensor
+                tensor = item[2] if len(item) == 3 else item[1]
+                # Official SmolVLA Paper strictly requires 576 dimensions (Layer 15)
+                if tensor.size(-1) != 576:
+                    shard_valid = False
+                    break
+            if shard_valid:
+                for item in items:
+                    orig_idx = item[0]
+                    tensor = item[2] if len(item) == 3 else item[1]
+                    existing_cached_items[orig_idx] = tensor
+            else:
+                try:
+                    os.remove(sf)
+                except OSError:
+                    pass
         except Exception:
             pass
 
