@@ -44,7 +44,7 @@ CACHE_VERSION = "v3_arch3b_multi_layer"
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(SHARDS_DIR, exist_ok=True)
 
-def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, user_workers_per_gpu=None):
+def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, user_workers_per_gpu=None, user_cache_batch_size=None):
     """
     Intelligently auto-adjusts batch sizes, num_workers, and workers_per_gpu
     based on available GPUs, VRAM per GPU, and CPU core count to prevent OOM while maximizing speed.
@@ -72,42 +72,45 @@ def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, use
         else:
             num_workers = num_gpus * workers_per_gpu
 
-        # Auto scale cache batch size based on VRAM (SmolVLM-256M is lightweight at ~300MB in bfloat16)
-        if total_vram_gb >= 40:
-            cache_batch_size = 32
-        elif total_vram_gb >= 24:
-            cache_batch_size = 16
-        elif total_vram_gb >= 16:
-            cache_batch_size = 8
+        # Cache batch size for VLM feature extraction
+        if user_cache_batch_size is not None and user_cache_batch_size > 0:
+            cache_batch_size = user_cache_batch_size
         else:
-            cache_batch_size = 4
+            if total_vram_gb >= 40:
+                cache_batch_size = 64
+            elif total_vram_gb >= 24:
+                cache_batch_size = 32
+            elif total_vram_gb >= 16:
+                cache_batch_size = 16
+            else:
+                cache_batch_size = 8
 
         # Auto training batch size for Action Expert (very lightweight — no VLM in training loop)
         if user_batch_size is not None and user_batch_size > 0:
             batch_size = user_batch_size
         else:
             if total_vram_gb >= 40:
-                batch_size = 512
+                batch_size = 1024
             elif total_vram_gb >= 24:
-                batch_size = 256
+                batch_size = 512
             elif total_vram_gb >= 16:
-                batch_size = 128
+                batch_size = 256
             else:
-                batch_size = 64
+                batch_size = 128
 
         hw_summary = (
             f"Hardware: {num_gpus}x {gpu_name} ({total_vram_gb:.1f} GB VRAM each) | {cpu_cores} CPU cores\n"
-            f">> Auto-Adjusted: workers_per_gpu={workers_per_gpu}, total_workers={num_workers}, "
+            f">> Configured: workers_per_gpu={workers_per_gpu}, total_workers={num_workers}, "
             f"cache_batch_size={cache_batch_size}, train_batch_size={batch_size} (in bfloat16/float16)"
         )
     else:
         num_workers = user_num_workers if (user_num_workers and user_num_workers > 0) else min(4, max(1, cpu_cores // 2))
         workers_per_gpu = 1
         batch_size = user_batch_size if (user_batch_size and user_batch_size > 0) else 16
-        cache_batch_size = 8
+        cache_batch_size = user_cache_batch_size if (user_cache_batch_size and user_cache_batch_size > 0) else 8
         hw_summary = (
             f"Hardware: CPU environment ({cpu_cores} cores)\n"
-            f">> Auto-Adjusted: CPU workers={num_workers}, cache_batch_size={cache_batch_size}, train_batch_size={batch_size}"
+            f">> Configured: CPU workers={num_workers}, cache_batch_size={cache_batch_size}, train_batch_size={batch_size}"
         )
 
     return {
@@ -433,11 +436,12 @@ def pad_collate_fn(batch):
     trajs = torch.stack(traj_list)
     return padded_raw, proprios, trajs
 
-def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_workers=None, workers_per_gpu=None, demosize=100):
+def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_workers=None, workers_per_gpu=None, demosize=100, cache_batch_size=None):
     hw = auto_detect_hardware_config(
         user_batch_size=batch_size,
         user_num_workers=num_workers,
-        user_workers_per_gpu=workers_per_gpu
+        user_workers_per_gpu=workers_per_gpu,
+        user_cache_batch_size=cache_batch_size
     )
     batch_size = hw["batch_size"]
     num_workers = hw["num_workers"]
@@ -555,6 +559,7 @@ if __name__ == "__main__":
     parser.add_argument("--recache", action="store_true", help="Force re-compute the SmolVLM multi-layer features")
     parser.add_argument("--num-workers", type=int, default=None, help="Total caching workers (default: auto-detected)")
     parser.add_argument("--workers-per-gpu", type=int, default=None, help="Workers per GPU (default: auto-detected)")
+    parser.add_argument("--cache-batch-size", type=int, default=None, help="Batch size for VLM feature caching extraction (default: auto-detected)")
     parser.add_argument("--demosize", type=int, default=100, help="Number of demos to auto-generate if missing (default: 100)")
     args, unknown = parser.parse_known_args()
 
@@ -568,5 +573,6 @@ if __name__ == "__main__":
         force_recache=args.recache,
         num_workers=args.num_workers,
         workers_per_gpu=args.workers_per_gpu,
-        demosize=args.demosize
+        demosize=args.demosize,
+        cache_batch_size=args.cache_batch_size
     )
