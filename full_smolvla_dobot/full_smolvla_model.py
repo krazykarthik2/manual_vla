@@ -110,9 +110,14 @@ class FullSmolVLAPolicy(nn.Module):
         # Official Paper: "we use a reduced hidden size of 0.75 * d for v_theta"
         self.d_model = int(0.75 * d_vlm) # 432
         
-        self.vlm_proj = nn.Sequential(
-            nn.LayerNorm(d_vlm),
-            nn.Linear(d_vlm, self.d_model)
+        # Adaptive projection: handles both 576 (single layer 15) and 1728 (legacy multi-layer 10,20,30)
+        self.proj_576 = nn.Sequential(
+            nn.LayerNorm(576),
+            nn.Linear(576, self.d_model)
+        )
+        self.proj_1728 = nn.Sequential(
+            nn.LayerNorm(1728),
+            nn.Linear(1728, self.d_model)
         )
 
         self.proprio_proj = nn.Sequential(
@@ -162,6 +167,11 @@ class FullSmolVLAPolicy(nn.Module):
             return layer_hidden
 
         return self.vlm_proj(layer_hidden)
+
+    def vlm_proj(self, hidden):
+        if hidden.size(-1) == 1728:
+            return self.proj_1728(hidden)
+        return self.proj_576(hidden)
 
     def forward(self, raw_hidden, proprio, x_t, t):
         vlm_tokens = self.vlm_proj(raw_hidden)
