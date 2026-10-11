@@ -20,27 +20,32 @@ export MKL_NUM_THREADS=$CORES
 export OPENBLAS_NUM_THREADS=$CORES
 
 # --- GPU DETECTION & AUTOSCALING ---
-if command -v nvidia-smi &> /dev/null; then
-    NUM_GPUS=$(nvidia-smi --list-gpus | wc -l)
-    GPU_NAMES=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader | paste -sd ", ")
-    TOTAL_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader | head -n 1)
-    echo "[INFO] Detected $NUM_GPUS NVIDIA GPU(s): $GPU_NAMES (VRAM: $TOTAL_VRAM)"
-    
-    if [ "$NUM_GPUS" -gt "1" ]; then
-        echo "[INFO] Multi-GPU environment detected. Exposing all GPUs for scaling."
-        # The python script explicitly utilizes `torch.cuda.device_count()` to spawn multiprocess extraction workers
-        export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $(($NUM_GPUS-1)))
-    fi
-    
-    # Optimize PyTorch CUDA memory allocator to eliminate VRAM fragmentation and prevent OOM
-    export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-    
-    # High performance interconnect configurations (if applicable)
-    export NCCL_P2P_DISABLE=0
-    export TF_CPP_MIN_LOG_LEVEL=3
+# Try nvidia-smi first; if it fails (e.g. NVML version mismatch), fall back to PyTorch directly
+GPU_CHECK=$(nvidia-smi -L 2>/dev/null)
+if [ -n "$GPU_CHECK" ]; then
+    NUM_GPUS=$(echo "$GPU_CHECK" | wc -l)
+    GPU_NAMES=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>/dev/null | paste -sd ", ")
+    TOTAL_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | head -n 1)
+    echo "[INFO] Detected $NUM_GPUS NVIDIA GPU(s) via NVML: $GPU_NAMES (VRAM: $TOTAL_VRAM)"
 else
-    echo "[WARN] nvidia-smi not found. Proceeding with CPU-only or non-NVIDIA GPU hardware assumptions."
+    # Fallback: query via PyTorch CUDA directly (bypasses broken NVML)
+    NUM_GPUS=$(python -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo 0)
+    if [ "$NUM_GPUS" -gt "0" ]; then
+        GPU_NAMES=$(python -c "import torch; print(', '.join([torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]))" 2>/dev/null)
+        echo "[INFO] Detected $NUM_GPUS NVIDIA GPU(s) via PyTorch Driver API: $GPU_NAMES"
+    else
+        echo "[WARN] No CUDA GPUs detected. Proceeding with CPU hardware assumptions."
+    fi
 fi
+
+if [ "$NUM_GPUS" -gt "1" ]; then
+    echo "[INFO] Multi-GPU environment detected. Exposing all GPUs for scaling."
+    export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $(($NUM_GPUS-1)))
+fi
+
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export NCCL_P2P_DISABLE=0
+export TF_CPP_MIN_LOG_LEVEL=3
 
 # Set file descriptor limit higher for parallel dataset I/O streaming
 ulimit -n 65535 2>/dev/null
