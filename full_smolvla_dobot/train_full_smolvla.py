@@ -605,7 +605,10 @@ def train(epochs=200, batch_size=None, lr=1e-4, force_recache=False, num_workers
                 proprio = proprio + proprio_noise
 
                 x_0 = torch.randn_like(x_1)
-                t = torch.rand(B, device=DEVICE)
+                # Official SmolVLA Paper Section 3.1: "we sample tau from a Beta distribution"
+                # Beta(1.5, 1.0) biases sampling toward middle/late trajectory refinement where grasping occurs
+                alpha_beta = torch.distributions.Beta(torch.tensor(1.5, device=DEVICE), torch.tensor(1.0, device=DEVICE))
+                t = alpha_beta.sample((B,)).clamp(1e-4, 1.0 - 1e-4)
                 t_expanded = t.view(B, 1, 1)
 
                 x_t = (1.0 - t_expanded) * x_0 + t_expanded * x_1
@@ -615,7 +618,8 @@ def train(epochs=200, batch_size=None, lr=1e-4, force_recache=False, num_workers
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32):
                     v_pred = policy(raw_hidden, proprio, x_t, t)
                     loss_raw = loss_fn(v_pred.float(), u_t)
-                    dim_weights = torch.tensor([1.2, 1.2, 1.5, 2.5], device=DEVICE).view(1, 1, 4)
+                    # Strengthen gripper commitment (index 3) to 3.5 to eliminate ambiguous grasp float outputs
+                    dim_weights = torch.tensor([1.2, 1.2, 1.5, 3.5], device=DEVICE).view(1, 1, 4)
                     flow_loss = (loss_raw * dim_weights).mean()
 
                 if torch.isnan(flow_loss) or torch.isinf(flow_loss):
