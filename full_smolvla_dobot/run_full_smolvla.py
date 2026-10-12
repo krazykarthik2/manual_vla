@@ -14,18 +14,12 @@ from full_smolvla_model import FullSmolVLAPolicy
 from train_full_smolvla import MODEL_DIR, DEVICE
 
 # -------------------------------------------------------------------
-# Global command‑line arguments (Supporting Section 3 Async Stack)
+# Global command‑line arguments
 # -------------------------------------------------------------------
-parser = argparse.ArgumentParser(description="Run Full SmolVLA inference (supporting Section 3 Async Stack).")
+parser = argparse.ArgumentParser(description="Run Full SmolVLA inference with optional horizon disabling.")
 parser.add_argument("--fast", action="store_true", help="Launch in fast lightspeed mode.")
-parser.add_argument("--no-horizon", action="store_true", default=False,
-                    help="Disable periodic replanning – execute full single chunk without async loop.")
-parser.add_argument("--async-mode", action="store_true", default=True,
-                    help="Enable Section 3.3 Asynchronous Inference Stack (Algorithm 1).")
-parser.add_argument("--queue-threshold", "-g", type=float, default=0.7,
-                    help="Queue threshold g in [0, 1] for async chunk refills (default: 0.7 from paper).")
-parser.add_argument("--sim-thresh", type=float, default=0.005,
-                    help="Joint-space observation similarity filter epsilon (default: 0.005).")
+parser.add_argument("--no-horizon", action="store_true", default=True,
+                    help="Disable periodic replanning – the policy will generate a single trajectory and follow it to the end.")
 args = parser.parse_args()
 
 
@@ -93,12 +87,6 @@ def run_full_smolvla(fast_mode=False):
     successful_episodes = 0
     failed_episodes = 0
 
-    # Section 3.3 Asynchronous Inference State
-    import concurrent.futures
-    async_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    async_future = None
-    last_observed_joint = np.zeros(3, dtype=np.float32)
-
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -152,71 +140,45 @@ def run_full_smolvla(fast_mode=False):
                 else:
                     episode_total_ticks += 1
 
-                    # Section 3.3 Asynchronous Inference Stack (Algorithm 1)
-                    if args.async_mode and not args.no_horizon:
-                        chunk_size = model.horizon # n = 128
-                        g = args.queue_threshold   # g = 0.7 from paper
-
-                        # 1. Check if queue is empty or below threshold g
-                        remaining_actions = len(current_trajectory) - traj_step if current_trajectory is not None else 0
-                        queue_ratio = remaining_actions / float(chunk_size)
-
-                        if current_trajectory is None:
-                            # Initial blocking observation
-                            with torch.no_grad():
-                                img_chw = obs["image"]
-                                img_hwc = (np.transpose(img_chw, (1, 2, 0)) * 255).astype(np.uint8)
-                                pil_img = Image.fromarray(img_hwc)
-                                proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0).to(device)
-                                current_trajectory = model.sample([pil_img], [sim.instruction], proprio=proprio_t, num_steps=10 if lightspeed else 15).squeeze(0).cpu().numpy()
-                                traj_step = 0
-                                last_observed_joint = obs["proprio"][:3].copy()
-                        elif queue_ratio < g and async_future is None:
-                            # Line 6-8: |A_t| / n < g -> check NeedsProcessing(o_{t+1})
-                            curr_joint = obs["proprio"][:3]
-                            joint_distance = np.linalg.norm(curr_joint - last_observed_joint)
-                            
-                            # Joint-space similarity filter: drop near-duplicates unless queue is nearly empty
-                            if joint_distance > args.sim_thresh or remaining_actions <= 2:
-                                last_observed_joint = curr_joint.copy()
-                                img_chw = obs["image"]
-                                img_hwc = (np.transpose(img_chw, (1, 2, 0)) * 255).astype(np.uint8)
-                                pil_img = Image.fromarray(img_hwc)
-                                proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0).to(device)
-                                
-                                # Line 9: async_handle <- AsyncInfer(o_{t+1}) non-blocking
-                                sample_steps = 10 if lightspeed else 15
-                                async_future = async_executor.submit(
-                                    lambda im=pil_img, pr=proprio_t, st=sample_steps: model.sample([im], [sim.instruction], proprio=pr, num_steps=st).squeeze(0).cpu().numpy()
-                                )
-
-                        # Line 10-11: If async inference completed, aggregate overlaps f(A_t, A_tilde_{t+1})
-                        if async_future is not None and async_future.done():
-                            new_chunk = async_future.result()
-                            async_future = None
-                            
-                            # Aggregate remaining queue with newly incoming queue
-                            rem_chunk = current_trajectory[traj_step:]
-                            rem_len = len(rem_chunk)
-                            if rem_len > 0:
-                                # Overlap blending on remaining steps
-                                alpha = np.linspace(0.8, 0.2, rem_len)[:, None]
-                                current_trajectory = (1 - alpha) * rem_chunk + alpha * new_chunk[:rem_len]
-                                current_trajectory = np.concatenate([current_trajectory, new_chunk[rem_len:]], axis=0)
-                            else:
-                                current_trajectory = new_chunk
-                            traj_step = 0
-
+                    # Horizon / replanning logic (controlled by --no-horizon flag or REPLAN_INTERVAL env var)
+                    if args.no_horizon:
+                        replan_interval = 10**6
                     else:
-                        # Synchronous baseline execution
-                        if (current_trajectory is None) or (traj_step >= len(current_trajectory)):
-                            with torch.no_grad():
-                                img_chw = obs["image"]
-                                img_hwc = (np.transpose(img_chw, (1, 2, 0)) * 255).astype(np.uint8)
-                                pil_img = Image.fromarray(img_hwc)
-                                proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0).to(device)
-                                current_trajectory = model.sample([pil_img], [sim.instruction], proprio=proprio_t, num_steps=10 if lightspeed else 15).squeeze(0).cpu().numpy()
-                                traj_step = 0
+                        replan_interval = int(os.getenv("REPLAN_INTERVAL", str(8 if device.type == "cuda" else 64)))
+                    need_replan = (current_trajectory is None) or (traj_step >= replan_interval)
+
+                    if need_replan:
+                        with torch.no_grad():
+                            img_chw = obs["image"]
+                            img_hwc = (np.transpose(img_chw, (1, 2, 0)) * 255).astype(np.uint8)
+                            pil_img = Image.fromarray(img_hwc)
+                            proprio_t = torch.tensor(obs["proprio"], dtype=torch.float32).unsqueeze(0).to(device)
+
+                            sample_steps = 10 if lightspeed else 15
+                            new_traj = model.sample(
+                                [pil_img],
+                                [sim.instruction],
+                                proprio=proprio_t,
+                                num_steps=sample_steps
+                            ).squeeze(0).cpu().numpy()
+
+                            if current_trajectory is None:
+                                current_trajectory = new_traj
+                            else:
+                                # Temporal Ensembling: Shift the remaining trajectory back by `traj_step` 
+                                # and exponentially average with the newly predicted trajectory.
+                                shifted_traj = np.zeros_like(current_trajectory)
+                                shift = traj_step
+                                valid_len = len(current_trajectory) - shift
+                                if valid_len > 0:
+                                    shifted_traj[:valid_len] = current_trajectory[shift:]
+                                    shifted_traj[valid_len:] = new_traj[valid_len:] # Pad with new if we run out
+                                
+                                # Soft update (Exponential Moving Average / Temporal Ensemble)
+                                alpha = np.linspace(0.8, 0.2, len(current_trajectory))[:, None]
+                                current_trajectory = (1 - alpha) * shifted_traj + alpha * new_traj
+
+                            traj_step = 0
 
                     if current_trajectory is not None and traj_step < len(current_trajectory):
                         target_point = current_trajectory[traj_step]
