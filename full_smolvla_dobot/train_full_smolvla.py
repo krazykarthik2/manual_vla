@@ -611,11 +611,11 @@ def train(epochs=200, batch_size=None, lr=1e-4, force_recache=False, num_workers
                 u_t = x_1 - x_0
 
                 # DataParallel splits the batch and handles vlm_proj + forward_from_embeddings
-                v_pred = policy(raw_hidden, proprio, x_t, t)
-
-                loss_raw = loss_fn(v_pred, u_t)
-                dim_weights = torch.tensor([1.2, 1.2, 1.5, 2.5], device=DEVICE).view(1, 1, 4)
-                flow_loss = (loss_raw * dim_weights).mean()
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32):
+                    v_pred = policy(raw_hidden, proprio, x_t, t)
+                    loss_raw = loss_fn(v_pred.float(), u_t)
+                    dim_weights = torch.tensor([1.2, 1.2, 1.5, 2.5], device=DEVICE).view(1, 1, 4)
+                    flow_loss = (loss_raw * dim_weights).mean()
 
                 if torch.isnan(flow_loss) or torch.isinf(flow_loss):
                     print(f"\n[ALERT] NaN/Inf detected in batch loss! v_pred={torch.isnan(v_pred).any().item()}, raw_hidden={torch.isnan(raw_hidden).any().item()}, proprio={torch.isnan(proprio).any().item()}, u_t={torch.isnan(u_t).any().item()}", flush=True)
