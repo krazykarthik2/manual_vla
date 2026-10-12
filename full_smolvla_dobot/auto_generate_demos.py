@@ -95,15 +95,11 @@ def get_augmented_prompt(action, target_color, target_plat_color):
         ]
     return str(np.random.choice(templates))
 
-def generate_single_demo(demo_idx, task_type=None):
+def generate_single_demo(demo_idx, task_type="pick_place"):
     pygame.init()
     
     sim = DobotPickPlaceSim()
-    # Task distribution: pick_place (50%), push (25%), sweep (25%)
-    if task_type is not None:
-        act_choice = task_type
-    else:
-        act_choice = str(np.random.choice(["pick_place", "push", "sweep"], p=[0.50, 0.25, 0.25]))
+    act_choice = task_type
 
     obs_dict = sim.reset(random_scene=True, num_distractors=2, action_type=act_choice)
     
@@ -145,8 +141,8 @@ def generate_single_demo(demo_idx, task_type=None):
         else:
             push_dir = np.array([1.0, 0.0])
 
-        behind_pos = target_start[:2] - push_dir * 0.040
-        push_dest = platform_target[:2] + push_dir * 0.010
+        behind_pos = target_start[:2] - push_dir * 0.024
+        push_dest = platform_target[:2] + push_dir * 0.005
 
         p_behind_high = np.array([behind_pos[0], behind_pos[1], 0.080], dtype=np.float32)
         p_behind_low = np.array([behind_pos[0], behind_pos[1], 0.015], dtype=np.float32)
@@ -156,38 +152,33 @@ def generate_single_demo(demo_idx, task_type=None):
 
         stages = [
             ("Move Behind", p_start, p_behind_high, 0.0, 0.0, calc_velocity_steps(p_start, p_behind_high, 0.009, 14)),
-            ("Lower Behind", p_behind_high, p_behind_low, 0.0, 0.0, calc_velocity_steps(p_behind_high, p_behind_low, 0.007, 10)),
-            ("Push Toward", p_behind_low, p_push_end, 0.0, 0.0, calc_velocity_steps(p_behind_low, p_push_end, 0.004, 30)),
+            ("Lower Behind", p_behind_high, p_behind_low, 0.0, 0.0, calc_velocity_steps(p_behind_high, p_behind_low, 0.006, 12)),
+            ("Push Toward", p_behind_low, p_push_end, 0.0, 0.0, calc_velocity_steps(p_behind_low, p_push_end, 0.003, 35)),
             ("Retract", p_push_end, p_retract, 0.0, 1.0, calc_velocity_steps(p_push_end, p_retract, 0.008, 10)),
             ("Return Home", p_retract, p_home, 0.0, 1.0, calc_velocity_steps(p_retract, p_home, 0.009, 14)),
         ]
     elif act_choice == "sweep":
-        # Sweep: Gripper approaches the lateral side of the cube, stays closed/paddle mode,
-        # and sweeps across toward the platform target
         sweep_vec = (platform_target[:2] - target_start[:2])
         dist = np.linalg.norm(sweep_vec)
         if dist > 0.01:
             u_vec = sweep_vec / dist
         else:
             u_vec = np.array([1.0, 0.0])
-        # Orthogonal normal vector
-        perp_vec = np.array([-u_vec[1], u_vec[0]], dtype=np.float32)
-        sweep_side = np.random.choice([-1.0, 1.0])
         
-        # Position slightly behind and to the side to sweep inward
-        side_start = target_start[:2] - u_vec * 0.035 + perp_vec * (sweep_side * 0.035)
-        sweep_end = platform_target[:2] + u_vec * 0.015
+        # Lateral paddle sweep
+        side_start = target_start[:2] - u_vec * 0.022
+        sweep_dest = platform_target[:2] + u_vec * 0.005
 
         p_side_high = np.array([side_start[0], side_start[1], 0.080], dtype=np.float32)
         p_side_low = np.array([side_start[0], side_start[1], 0.015], dtype=np.float32)
-        p_sweep_end = np.array([sweep_end[0], sweep_end[1], 0.015], dtype=np.float32)
-        p_retract = np.array([sweep_end[0], sweep_end[1], 0.100], dtype=np.float32)
+        p_sweep_end = np.array([sweep_dest[0], sweep_dest[1], 0.015], dtype=np.float32)
+        p_retract = np.array([sweep_dest[0], sweep_dest[1], 0.100], dtype=np.float32)
         p_home = np.array([0.20, 0.0, 0.12], dtype=np.float32)
 
         stages = [
             ("Move Lateral", p_start, p_side_high, 0.0, 0.0, calc_velocity_steps(p_start, p_side_high, 0.009, 14)),
-            ("Lower Paddle", p_side_high, p_side_low, 0.0, 0.0, calc_velocity_steps(p_side_high, p_side_low, 0.007, 10)),
-            ("Sweep Arc", p_side_low, p_sweep_end, 0.0, 0.0, calc_velocity_steps(p_side_low, p_sweep_end, 0.004, 30)),
+            ("Lower Paddle", p_side_high, p_side_low, 0.0, 0.0, calc_velocity_steps(p_side_high, p_side_low, 0.006, 12)),
+            ("Sweep Paddle", p_side_low, p_sweep_end, 0.0, 0.0, calc_velocity_steps(p_side_low, p_sweep_end, 0.003, 35)),
             ("Retract", p_sweep_end, p_retract, 0.0, 1.0, calc_velocity_steps(p_sweep_end, p_retract, 0.008, 10)),
             ("Return Home", p_retract, p_home, 0.0, 1.0, calc_velocity_steps(p_retract, p_home, 0.009, 14)),
         ]
@@ -216,8 +207,6 @@ def generate_single_demo(demo_idx, task_type=None):
     if act_choice == "pick_place":
         task_success = (final_cube_dist_to_plat < 0.045 and sim.target_cube_pos[2] <= 0.030 and not sim.gripper_closed)
     elif act_choice in ["push", "sweep"]:
-        # For pushing and sweeping, success requires the cube being transported within 0.050m of platform
-        # without requiring lifting or gripper release
         task_success = (final_cube_dist_to_plat < 0.050)
     else:
         task_success = False
@@ -235,35 +224,106 @@ def generate_single_demo(demo_idx, task_type=None):
         return True
     return False
 
+def count_demos_by_task():
+    """Count how many demos exist for each task type in the dataset directory."""
+    counts = {"pick_place": 0, "push": 0, "sweep": 0}
+    for f in os.listdir(DATA_DIR):
+        if f.startswith("demo_") and f.endswith(".npz"):
+            path = os.path.join(DATA_DIR, f)
+            try:
+                data = np.load(path, allow_pickle=True)
+                p = str(data["prompt"][0]).lower() if "prompt" in data else ""
+                if "sweep" in p or "brush" in p or "rake" in p or "paddle" in p:
+                    counts["sweep"] += 1
+                elif "push" in p or "slide" in p or "shove" in p or "nudge" in p or "glide" in p or "ram" in p or "displace" in p:
+                    counts["push"] += 1
+                else:
+                    counts["pick_place"] += 1
+            except Exception:
+                pass
+    return counts
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_demos", type=int, default=50)
+    parser.add_argument("--num_demos", type=int, default=12000, help="Total target number of successful demonstrations to achieve.")
+    parser.add_argument("--pick_ratio", type=float, default=0.50, help="Ratio of pick_place demonstrations.")
+    parser.add_argument("--push_ratio", type=float, default=0.25, help="Ratio of push demonstrations.")
+    parser.add_argument("--sweep_ratio", type=float, default=0.25, help="Ratio of sweep demonstrations.")
+    parser.add_argument("--batch_workers", type=int, default=None, help="Number of parallel processes.")
     args = parser.parse_args()
     
-    num_demos = args.num_demos
-    start_count = count_saved_demos()
-    print(f"Current saved demonstrations: {start_count}")
-    print(f"Generating {num_demos} demonstrations in parallel (Autoscaling CPU workers)...")
+    target_total = args.num_demos
+    current_counts = count_demos_by_task()
+    total_existing = sum(current_counts.values())
+    
+    target_pick = int(round(target_total * args.pick_ratio))
+    target_push = int(round(target_total * args.push_ratio))
+    target_sweep = target_total - target_pick - target_push
 
-    start_idx = get_next_demo_index()
-    demo_indices = range(start_idx, start_idx + num_demos)
-    
-    success_count = 0
+    print(f"===========================================================")
+    print(f"Goal: Guarantee exactly {target_total} valid demonstrations")
+    print(f"Targets: pick_place={target_pick}, push={target_push}, sweep={target_sweep}")
+    print(f"Current: pick_place={current_counts['pick_place']}, push={current_counts['push']}, sweep={current_counts['sweep']} (Total={total_existing})")
+    print(f"===========================================================")
+
+    if total_existing >= target_total:
+        print(f"Database already has {total_existing} >= {target_total} demos! Nothing to do.")
+        sys.exit(0)
+
     start_time = time.time()
+    max_workers = args.batch_workers or os.cpu_count() or 4
     
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        futures = [executor.submit(generate_single_demo, idx) for idx in demo_indices]
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
-            res = future.result()
-            if res:
-                success_count += 1
-            if (i + 1) % 10 == 0:
-                print(f"Completed {i+1}/{num_demos} trajectories...")
-                
+    # Continuous quota loop until targets for every task are reached
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        while True:
+            current_counts = count_demos_by_task()
+            needed_pick = max(0, target_pick - current_counts["pick_place"])
+            needed_push = max(0, target_push - current_counts["push"])
+            needed_sweep = max(0, target_sweep - current_counts["sweep"])
+            needed_total = needed_pick + needed_push + needed_sweep
+
+            if needed_total == 0:
+                break
+
+            # Pick which task needs more demos
+            candidate_tasks = []
+            candidate_weights = []
+            if needed_pick > 0:
+                candidate_tasks.append("pick_place")
+                candidate_weights.append(needed_pick)
+            if needed_push > 0:
+                candidate_tasks.append("push")
+                candidate_weights.append(needed_push)
+            if needed_sweep > 0:
+                candidate_tasks.append("sweep")
+                candidate_weights.append(needed_sweep)
+            
+            p_dist = np.array(candidate_weights, dtype=np.float32) / sum(candidate_weights)
+
+            # Dispatch a chunk of parallel jobs
+            chunk_size = min(max_workers * 4, needed_total * 2, 200)
+            next_idx = get_next_demo_index()
+            
+            job_tasks = [np.random.choice(candidate_tasks, p=p_dist) for _ in range(chunk_size)]
+            futures = [
+                executor.submit(generate_single_demo, next_idx + i, job_tasks[i])
+                for i in range(chunk_size)
+            ]
+            
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    pass
+
+            current_total = count_saved_demos()
+            print(f"Progress: {current_total}/{target_total} valid demos saved | Remaining: pick={needed_pick}, push={needed_push}, sweep={needed_sweep}")
+
     elapsed = time.time() - start_time
+    final_counts = count_demos_by_task()
     print(f"\n=================================")
-    print(f"Generation Complete! ({success_count}/{num_demos} successful)")
-    print(f"Time Taken: {elapsed:.1f}s")
-    print(f"Total Database Size: {count_saved_demos()} trajectories")
+    print(f"Quota Reached! Database Size: {count_saved_demos()} trajectories")
+    print(f"Task Breakdown: pick_place={final_counts['pick_place']}, push={final_counts['push']}, sweep={final_counts['sweep']}")
+    print(f"Time Elapsed: {elapsed:.1f}s")
     print(f"=================================")
