@@ -154,8 +154,12 @@ class DobotPickPlaceSim:
             else:
                 if self.action_type == "pick_place":
                     self.instruction = f"pick up the {self.target_color} cube and place it on the {self.target_plat_color} platform"
-                else:
+                elif self.action_type == "push":
                     self.instruction = f"push the {self.target_color} cube towards the {self.target_plat_color} platform"
+                elif self.action_type == "sweep":
+                    self.instruction = f"sweep the {self.target_color} cube to the platform"
+                else:
+                    self.instruction = f"pick up the {self.target_color} cube and place it on the {self.target_plat_color} platform"
         else:
             self.target_color = "red"
             self.target_plat_color = "green"

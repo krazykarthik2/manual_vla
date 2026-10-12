@@ -51,29 +51,60 @@ def calc_velocity_steps(p1, p2, target_step_size=0.008, min_steps=8):
     return steps
 
 def get_augmented_prompt(action, target_color, target_plat_color):
+    cube_synonyms = ["cube", "block", "object", "item", "box"]
+    plat_synonyms = ["platform", "base", "plate", "target pad", "mat", "spot", "landing zone"]
+    
+    cb = str(np.random.choice(cube_synonyms))
+    pl = str(np.random.choice(plat_synonyms))
+    
     if action == "pick_place":
-        prompts = [
-            f"pick up the {target_color} cube and place it on the {target_plat_color} platform",
-            f"move the {target_color} block to the {target_plat_color} base",
-            f"transport the {target_color} object onto the {target_plat_color} plate",
-            f"grab the {target_color} cube, then drop it on the {target_plat_color} spot"
+        templates = [
+            f"pick up the {target_color} {cb} and place it on the {target_plat_color} {pl}",
+            f"pick the {target_color} {cb} and drop it onto the {target_plat_color} {pl}",
+            f"grasp the {target_color} {cb} and set it down on the {target_plat_color} {pl}",
+            f"move the {target_color} {cb} to the {target_plat_color} {pl}",
+            f"transport the {target_color} {cb} onto the {target_plat_color} {pl}",
+            f"grab the {target_color} {cb}, then place it on the {target_plat_color} {pl}",
+            f"lift the {target_color} {cb} and put it on the {target_plat_color} {pl}",
+            f"take the {target_color} {cb} and deliver it to the {target_plat_color} {pl}"
+        ]
+    elif action == "push":
+        templates = [
+            f"push the {target_color} {cb} towards the {target_plat_color} {pl}",
+            f"slide the {target_color} {cb} into the {target_plat_color} {pl}",
+            f"shove the {target_color} {cb} near the {target_plat_color} {pl}",
+            f"nudge the {target_color} {cb} towards the {target_plat_color} {pl}",
+            f"push the {target_color} {cb} onto the {target_plat_color} {pl}",
+            f"glide the {target_color} {cb} to the {target_plat_color} {pl}",
+            f"ram the {target_color} {cb} forward into the {target_plat_color} {pl}",
+            f"displace the {target_color} {cb} towards the {target_plat_color} {pl}"
+        ]
+    elif action == "sweep":
+        templates = [
+            f"sweep the {target_color} {cb} to the {target_plat_color} {pl}",
+            f"sweep the {target_color} {cb} across to the {target_plat_color} {pl}",
+            f"brush the {target_color} {cb} towards the {target_plat_color} {pl}",
+            f"rake the {target_color} {cb} to the {target_plat_color} {pl}",
+            f"sweep the {target_color} {cb} into the target zone",
+            f"paddle the {target_color} {cb} towards the {target_plat_color} {pl}",
+            f"sweep the {target_color} {cb} over to the {target_plat_color} {pl}"
         ]
     else:
-        prompts = [
-            f"push the {target_color} cube towards the {target_plat_color} platform",
-            f"slide the {target_color} block into the {target_plat_color} base",
-            f"shove the {target_color} object near the {target_plat_color} plate",
-            f"nudge the {target_color} cube towards the {target_plat_color} spot"
+        templates = [
+            f"pick up the {target_color} {cb} and place it on the {target_plat_color} {pl}"
         ]
-    return str(np.random.choice(prompts))
+    return str(np.random.choice(templates))
 
-def generate_single_demo(demo_idx):
+def generate_single_demo(demo_idx, task_type=None):
     pygame.init()
     
     sim = DobotPickPlaceSim()
-    # Force 100% pick_place tasks since this is what we evaluate on.
-    # Training on Push corrupted the grip behaviour.
-    act_choice = "pick_place"
+    # Task distribution: pick_place (50%), push (25%), sweep (25%)
+    if task_type is not None:
+        act_choice = task_type
+    else:
+        act_choice = str(np.random.choice(["pick_place", "push", "sweep"], p=[0.50, 0.25, 0.25]))
+
     obs_dict = sim.reset(random_scene=True, num_distractors=2, action_type=act_choice)
     
     target_start = sim.target_cube_pos.copy()
@@ -97,16 +128,16 @@ def generate_single_demo(demo_idx):
         p_retract = np.array([platform_target[0], platform_target[1], 0.12], dtype=np.float32)
 
         stages = [
-            (f"Approach", p_start, p_hover_cube, 0.0, 0.0, calc_velocity_steps(p_start, p_hover_cube, 0.009, 14)),
-            (f"Descend", p_hover_cube, p_cube_surface, 0.0, 0.0, calc_velocity_steps(p_hover_cube, p_cube_surface, 0.007, 12)),
-            (f"Grasp", p_cube_surface, p_cube_surface, 1.0, 0.0, int(np.random.randint(5, 8))),
-            (f"Lift", p_cube_surface, p_hover_cube, 1.0, 0.0, calc_velocity_steps(p_cube_surface, p_hover_cube, 0.007, 12)),
-            (f"Carry", p_hover_cube, p_hover_plat, 1.0, 0.0, calc_velocity_steps(p_hover_cube, p_hover_plat, 0.009, 16)),
-            (f"Lower", p_hover_plat, p_plat_surface, 1.0, 0.0, calc_velocity_steps(p_hover_plat, p_plat_surface, 0.007, 12)),
-            (f"Release", p_plat_surface, p_plat_surface, 0.0, 1.0, int(np.random.randint(5, 8))),
+            ("Approach", p_start, p_hover_cube, 0.0, 0.0, calc_velocity_steps(p_start, p_hover_cube, 0.009, 14)),
+            ("Descend", p_hover_cube, p_cube_surface, 0.0, 0.0, calc_velocity_steps(p_hover_cube, p_cube_surface, 0.007, 12)),
+            ("Grasp", p_cube_surface, p_cube_surface, 1.0, 0.0, int(np.random.randint(5, 8))),
+            ("Lift", p_cube_surface, p_hover_cube, 1.0, 0.0, calc_velocity_steps(p_cube_surface, p_hover_cube, 0.007, 12)),
+            ("Carry", p_hover_cube, p_hover_plat, 1.0, 0.0, calc_velocity_steps(p_hover_cube, p_hover_plat, 0.009, 16)),
+            ("Lower", p_hover_plat, p_plat_surface, 1.0, 0.0, calc_velocity_steps(p_hover_plat, p_plat_surface, 0.007, 12)),
+            ("Release", p_plat_surface, p_plat_surface, 0.0, 1.0, int(np.random.randint(5, 8))),
             ("Retract", p_plat_surface, p_retract, 0.0, 1.0, calc_velocity_steps(p_plat_surface, p_retract, 0.008, 10)),
         ]
-    else: # "push"
+    elif act_choice == "push":
         push_dir = (platform_target[:2] - target_start[:2])
         dist = np.linalg.norm(push_dir)
         if dist > 0.01:
@@ -114,7 +145,7 @@ def generate_single_demo(demo_idx):
         else:
             push_dir = np.array([1.0, 0.0])
 
-        behind_pos = target_start[:2] - push_dir * 0.038
+        behind_pos = target_start[:2] - push_dir * 0.040
         push_dest = platform_target[:2] + push_dir * 0.010
 
         p_behind_high = np.array([behind_pos[0], behind_pos[1], 0.080], dtype=np.float32)
@@ -124,11 +155,41 @@ def generate_single_demo(demo_idx):
         p_home = np.array([0.20, 0.0, 0.12], dtype=np.float32)
 
         stages = [
-            (f"Move Behind", p_start, p_behind_high, 0.0, 0.0, calc_velocity_steps(p_start, p_behind_high, 0.009, 14)),
-            (f"Lower Behind", p_behind_high, p_behind_low, 0.0, 0.0, calc_velocity_steps(p_behind_high, p_behind_low, 0.007, 10)),
-            (f"Push Toward", p_behind_low, p_push_end, 0.0, 0.0, calc_velocity_steps(p_behind_low, p_push_end, 0.005, 25)),
-            (f"Retract", p_push_end, p_retract, 0.0, 1.0, calc_velocity_steps(p_push_end, p_retract, 0.008, 10)),
-            (f"Return Home", p_retract, p_home, 0.0, 1.0, calc_velocity_steps(p_retract, p_home, 0.009, 14)),
+            ("Move Behind", p_start, p_behind_high, 0.0, 0.0, calc_velocity_steps(p_start, p_behind_high, 0.009, 14)),
+            ("Lower Behind", p_behind_high, p_behind_low, 0.0, 0.0, calc_velocity_steps(p_behind_high, p_behind_low, 0.007, 10)),
+            ("Push Toward", p_behind_low, p_push_end, 0.0, 0.0, calc_velocity_steps(p_behind_low, p_push_end, 0.004, 30)),
+            ("Retract", p_push_end, p_retract, 0.0, 1.0, calc_velocity_steps(p_push_end, p_retract, 0.008, 10)),
+            ("Return Home", p_retract, p_home, 0.0, 1.0, calc_velocity_steps(p_retract, p_home, 0.009, 14)),
+        ]
+    elif act_choice == "sweep":
+        # Sweep: Gripper approaches the lateral side of the cube, stays closed/paddle mode,
+        # and sweeps across toward the platform target
+        sweep_vec = (platform_target[:2] - target_start[:2])
+        dist = np.linalg.norm(sweep_vec)
+        if dist > 0.01:
+            u_vec = sweep_vec / dist
+        else:
+            u_vec = np.array([1.0, 0.0])
+        # Orthogonal normal vector
+        perp_vec = np.array([-u_vec[1], u_vec[0]], dtype=np.float32)
+        sweep_side = np.random.choice([-1.0, 1.0])
+        
+        # Position slightly behind and to the side to sweep inward
+        side_start = target_start[:2] - u_vec * 0.035 + perp_vec * (sweep_side * 0.035)
+        sweep_end = platform_target[:2] + u_vec * 0.015
+
+        p_side_high = np.array([side_start[0], side_start[1], 0.080], dtype=np.float32)
+        p_side_low = np.array([side_start[0], side_start[1], 0.015], dtype=np.float32)
+        p_sweep_end = np.array([sweep_end[0], sweep_end[1], 0.015], dtype=np.float32)
+        p_retract = np.array([sweep_end[0], sweep_end[1], 0.100], dtype=np.float32)
+        p_home = np.array([0.20, 0.0, 0.12], dtype=np.float32)
+
+        stages = [
+            ("Move Lateral", p_start, p_side_high, 0.0, 0.0, calc_velocity_steps(p_start, p_side_high, 0.009, 14)),
+            ("Lower Paddle", p_side_high, p_side_low, 0.0, 0.0, calc_velocity_steps(p_side_high, p_side_low, 0.007, 10)),
+            ("Sweep Arc", p_side_low, p_sweep_end, 0.0, 0.0, calc_velocity_steps(p_side_low, p_sweep_end, 0.004, 30)),
+            ("Retract", p_sweep_end, p_retract, 0.0, 1.0, calc_velocity_steps(p_sweep_end, p_retract, 0.008, 10)),
+            ("Return Home", p_retract, p_home, 0.0, 1.0, calc_velocity_steps(p_retract, p_home, 0.009, 14)),
         ]
 
     for stage_name, start_pt, end_pt, grip_state, succ_state, steps in stages:
@@ -149,9 +210,17 @@ def generate_single_demo(demo_idx):
             action_list.append(action_vec)
             sim.step_delta(action_vec)
 
-    # Verify the task actually succeeded before saving!
+    # Verify task success according to task type!
     final_cube_dist_to_plat = np.linalg.norm(sim.target_cube_pos[:2] - sim.target_platform_pos[:2])
-    task_success = (final_cube_dist_to_plat < 0.040 and sim.target_cube_pos[2] <= 0.025 and not sim.gripper_closed)
+    
+    if act_choice == "pick_place":
+        task_success = (final_cube_dist_to_plat < 0.045 and sim.target_cube_pos[2] <= 0.030 and not sim.gripper_closed)
+    elif act_choice in ["push", "sweep"]:
+        # For pushing and sweeping, success requires the cube being transported within 0.050m of platform
+        # without requiring lifting or gripper release
+        task_success = (final_cube_dist_to_plat < 0.050)
+    else:
+        task_success = False
 
     if task_success and len(action_list) > 15:
         save_path = os.path.join(DATA_DIR, f"demo_{demo_idx:06d}.npz")
