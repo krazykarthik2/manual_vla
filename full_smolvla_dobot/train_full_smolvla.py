@@ -617,6 +617,10 @@ def train(epochs=200, batch_size=None, lr=1e-4, force_recache=False, num_workers
                 dim_weights = torch.tensor([1.2, 1.2, 1.5, 2.5], device=DEVICE).view(1, 1, 4)
                 flow_loss = (loss_raw * dim_weights).mean()
 
+                if torch.isnan(flow_loss) or torch.isinf(flow_loss):
+                    print(f"\n[ALERT] NaN/Inf detected in batch loss! v_pred={torch.isnan(v_pred).any().item()}, raw_hidden={torch.isnan(raw_hidden).any().item()}, proprio={torch.isnan(proprio).any().item()}, u_t={torch.isnan(u_t).any().item()}", flush=True)
+                    continue
+
                 flow_loss.backward()
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
                 if optimizer_muon:
