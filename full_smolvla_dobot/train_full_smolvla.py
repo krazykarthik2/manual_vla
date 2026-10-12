@@ -44,6 +44,72 @@ CACHE_VERSION = "v3_arch3b_multi_layer"
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(SHARDS_DIR, exist_ok=True)
 
+# -----------------------------------------------------------------------------
+# Muon Optimizer (Keller Jordan et al.)
+# Orthogonalized Momentum via Newton-Schulz iteration for 2D+ matrix weights.
+# Paired with AdamW for 1D tensors (embeddings, biases, layer norms).
+# -----------------------------------------------------------------------------
+def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G.
+    Equivalent to polar decomposition G (G^T G)^{-1/2}.
+    """
+    assert G.ndim >= 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16() if G.is_cuda and torch.cuda.is_bf16_supported() else G.float()
+    X /= (X.norm() + eps)
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X.to(G.dtype)
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz.
+    Applied strictly to hidden matrix weights (ndim >= 2).
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(g)
+                if nesterov:
+                    g = g.add(buf, alpha=momentum)
+                else:
+                    g = buf
+                u = zeropower_via_newtonschulz5(g, steps=ns_steps)
+                # Scale by root aspect ratio to match standard parameter updates
+                u *= max(1, g.size(0) / g.size(1)) ** 0.5
+                p.data.add_(u, alpha=-lr)
+
+        return loss
+
 def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, user_workers_per_gpu=None, user_cache_batch_size=None):
     """
     Intelligently auto-adjusts batch sizes, num_workers, and workers_per_gpu
@@ -436,7 +502,7 @@ def pad_collate_fn(batch):
     trajs = torch.stack(traj_list)
     return padded_raw, proprios, trajs
 
-def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_workers=None, workers_per_gpu=None, demosize=100, cache_batch_size=None):
+def train(epochs=200, batch_size=None, lr=1e-4, force_recache=False, num_workers=None, workers_per_gpu=None, demosize=100, cache_batch_size=None):
     hw = auto_detect_hardware_config(
         user_batch_size=batch_size,
         user_num_workers=num_workers,
@@ -472,11 +538,42 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
         policy = nn.DataParallel(policy)
     policy.train()
 
-    trainable_params = [p for p in policy.parameters() if p.requires_grad]
-    print(f">> Trainable Policy Parameters: {sum(p.numel() for p in trainable_params):,}", flush=True)
+    # Partition parameters: Muon handles 2D+ matrix weights; AdamW handles 1D parameters (biases, norms, embeddings)
+    raw_policy = policy.module if isinstance(policy, nn.DataParallel) else policy
+    muon_params = []
+    adamw_params = []
+    for name, p in raw_policy.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim >= 2 and "pos_queries" not in name:
+            muon_params.append(p)
+        else:
+            adamw_params.append(p)
 
-    optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+    total_params = sum(p.numel() for p in raw_policy.parameters() if p.requires_grad)
+    print(f">> Trainable Policy Parameters: {total_params:,} (Muon: {sum(p.numel() for p in muon_params):,} params | AdamW: {sum(p.numel() for p in adamw_params):,} params)", flush=True)
+
+    # Muon optimizer for 2D matrix weights (stable orthogonal updates)
+    muon_lr = 0.02
+    optimizer_muon = Muon(muon_params, lr=muon_lr, momentum=0.95) if muon_params else None
+
+    # AdamW optimizer for embeddings, biases, and normalization layers
+    optimizer_adamw = optim.AdamW(adamw_params, lr=lr, betas=(0.9, 0.95), weight_decay=1e-4) if adamw_params else None
+
+    warmup_epochs = max(1, min(5, epochs // 10))
+    schedulers = []
+    if optimizer_adamw is not None:
+        w_adamw = optim.lr_scheduler.LinearLR(optimizer_adamw, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+        c_adamw = optim.lr_scheduler.CosineAnnealingLR(optimizer_adamw, T_max=epochs - warmup_epochs, eta_min=2.5e-6)
+        sched_adamw = optim.lr_scheduler.SequentialLR(optimizer_adamw, schedulers=[w_adamw, c_adamw], milestones=[warmup_epochs])
+        schedulers.append(sched_adamw)
+
+    if optimizer_muon is not None:
+        w_muon = optim.lr_scheduler.LinearLR(optimizer_muon, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+        c_muon = optim.lr_scheduler.CosineAnnealingLR(optimizer_muon, T_max=epochs - warmup_epochs, eta_min=1e-4)
+        sched_muon = optim.lr_scheduler.SequentialLR(optimizer_muon, schedulers=[w_muon, c_muon], milestones=[warmup_epochs])
+        schedulers.append(sched_muon)
+
     loss_fn = nn.MSELoss(reduction='none')
 
     model_path = os.path.join(MODEL_DIR, "dobot_full_smolvla_policy.pth")
@@ -494,7 +591,10 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
                 x_1 = x_1.to(DEVICE)
 
                 B = raw_hidden.size(0)
-                optimizer.zero_grad(set_to_none=True)
+                if optimizer_muon:
+                    optimizer_muon.zero_grad(set_to_none=True)
+                if optimizer_adamw:
+                    optimizer_adamw.zero_grad(set_to_none=True)
 
                 # ---- DATA AUGMENTATION (COVARIATE SHIFT FIX) ----
                 # Inject a small random uniform noise (±1.5cm) into the starting proprioceptive state.
@@ -519,10 +619,14 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
 
                 flow_loss.backward()
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
-                optimizer.step()
+                if optimizer_muon:
+                    optimizer_muon.step()
+                if optimizer_adamw:
+                    optimizer_adamw.step()
                 total_loss += flow_loss.item() * B
 
-            scheduler.step()
+            for s in schedulers:
+                s.step()
             avg_loss = total_loss / len(dataset)
 
             if avg_loss < best_loss or epoch % 10 == 0:
@@ -532,7 +636,7 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
                 filtered = {k: v for k, v in model_to_save.state_dict().items() if not k.startswith("smolvlm.")}
                 safe_save_model(filtered, model_path)
 
-            current_lr = scheduler.get_last_lr()[0]
+            current_lr = schedulers[0].get_last_lr()[0] if schedulers else lr
             epoch_pbar.set_postfix({
                 "OT_Loss": f"{avg_loss:.5f}",
                 "Best": f"{best_loss:.5f}",
@@ -555,7 +659,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Auto-Tuned Multi-GPU / Multi-Worker Parallel Training for Full SmolVLA")
     parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs (default: 200)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: auto-detected based on GPU VRAM)")
-    parser.add_argument("--lr", type=float, default=1.5e-3, help="Learning rate (default: 1.5e-3)")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (default: 1e-4, matching SmolVLA paper)")
     parser.add_argument("--recache", action="store_true", help="Force re-compute the SmolVLM multi-layer features")
     parser.add_argument("--num-workers", type=int, default=None, help="Total caching workers (default: auto-detected)")
     parser.add_argument("--workers-per-gpu", type=int, default=None, help="Workers per GPU (default: auto-detected)")

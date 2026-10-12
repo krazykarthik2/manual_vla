@@ -41,8 +41,8 @@ class SABlock(nn.Module):
     def forward(self, x):
         q = self.norm1(x)
         L = q.size(1)
-        mask = torch.triu(torch.ones(L, L, device=x.device) * float('-inf'), diagonal=1)
-        attn_out, _ = self.attn(q, q, q, attn_mask=mask, is_causal=True)
+        mask = torch.triu(torch.ones(L, L, device=x.device, dtype=torch.bool), diagonal=1)
+        attn_out, _ = self.attn(q, q, q, attn_mask=mask)
         x = x + attn_out
         x = x + self.ffn(self.norm2(x))
         return x
