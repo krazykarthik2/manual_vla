@@ -231,17 +231,26 @@ class FullSmolVLAPolicy(nn.Module):
         dt = 1.0 / num_steps
         last_acts = None
 
+        # 2nd-Order Midpoint (RK2) ODE Solver: cuts integration drift and eliminates waypoint jitter
         for i in range(num_steps):
-            t = torch.full((B,), (i + 0.5) * dt, device=self.device)
+            t_curr = torch.full((B,), i * dt, device=self.device)
+            v_curr = self.forward_from_embeddings(x, t_curr, vlm_tokens, proprio=proprio, return_activations=False)
+            
+            # Midpoint step
+            x_mid = x + 0.5 * dt * v_curr
+            t_mid = torch.full((B,), (i + 0.5) * dt, device=self.device)
+            
             need_act = return_activations and (i == num_steps - 1)
             if need_act:
-                v, last_acts = self.forward_from_embeddings(x, t, vlm_tokens, proprio=proprio, return_activations=True)
+                v_mid, last_acts = self.forward_from_embeddings(x_mid, t_mid, vlm_tokens, proprio=proprio, return_activations=True)
             else:
-                v = self.forward_from_embeddings(x, t, vlm_tokens, proprio=proprio, return_activations=False)
-            x = x + v * dt
+                v_mid = self.forward_from_embeddings(x_mid, t_mid, vlm_tokens, proprio=proprio, return_activations=False)
+            
+            x = x + v_mid * dt
 
         raw_x = x * ACTION_STD + ACTION_MEAN
-        kernel = torch.ones(1, 1, 5, device=self.device) / 5.0
+        # 5-tap Gaussian kernel [0.06, 0.24, 0.40, 0.24, 0.06] preserves sharp grasp transitions while smoothing continuous XYZ
+        kernel = torch.tensor([0.06136, 0.24477, 0.38774, 0.24477, 0.06136], device=self.device).view(1, 1, 5)
         raw_perm = raw_x.permute(0, 2, 1).reshape(B * self.action_dim, 1, self.horizon)
         smoothed = F.conv1d(raw_perm, kernel, padding=2)
         smoothed = smoothed.view(B, self.action_dim, self.horizon).permute(0, 2, 1)
