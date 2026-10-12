@@ -44,7 +44,73 @@ CACHE_VERSION = "v3_arch3b_multi_layer"
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(SHARDS_DIR, exist_ok=True)
 
-def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, user_workers_per_gpu=None):
+# -----------------------------------------------------------------------------
+# Muon Optimizer (Keller Jordan et al.)
+# Orthogonalized Momentum via Newton-Schulz iteration for 2D+ matrix weights.
+# Paired with AdamW for 1D tensors (embeddings, biases, layer norms).
+# -----------------------------------------------------------------------------
+def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G.
+    Equivalent to polar decomposition G (G^T G)^{-1/2}.
+    """
+    assert G.ndim >= 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16() if G.is_cuda and torch.cuda.is_bf16_supported() else G.float()
+    X /= (X.norm() + eps)
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X.to(G.dtype)
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz.
+    Applied strictly to hidden matrix weights (ndim >= 2).
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(g)
+                if nesterov:
+                    g = g.add(buf, alpha=momentum)
+                else:
+                    g = buf
+                u = zeropower_via_newtonschulz5(g, steps=ns_steps)
+                # Scale by root aspect ratio to match standard parameter updates
+                u *= max(1, g.size(0) / g.size(1)) ** 0.5
+                p.data.add_(u, alpha=-lr)
+
+        return loss
+
+def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, user_workers_per_gpu=None, user_cache_batch_size=None):
     """
     Intelligently auto-adjusts batch sizes, num_workers, and workers_per_gpu
     based on available GPUs, VRAM per GPU, and CPU core count to prevent OOM while maximizing speed.
@@ -72,42 +138,45 @@ def auto_detect_hardware_config(user_batch_size=None, user_num_workers=None, use
         else:
             num_workers = num_gpus * workers_per_gpu
 
-        # Auto scale cache batch size based on VRAM (SmolVLM-256M is lightweight at ~300MB in bfloat16)
-        if total_vram_gb >= 40:
-            cache_batch_size = 32
-        elif total_vram_gb >= 24:
-            cache_batch_size = 16
-        elif total_vram_gb >= 16:
-            cache_batch_size = 8
+        # Cache batch size for VLM feature extraction
+        if user_cache_batch_size is not None and user_cache_batch_size > 0:
+            cache_batch_size = user_cache_batch_size
         else:
-            cache_batch_size = 4
+            if total_vram_gb >= 40:
+                cache_batch_size = 64
+            elif total_vram_gb >= 24:
+                cache_batch_size = 32
+            elif total_vram_gb >= 16:
+                cache_batch_size = 16
+            else:
+                cache_batch_size = 8
 
         # Auto training batch size for Action Expert (very lightweight — no VLM in training loop)
         if user_batch_size is not None and user_batch_size > 0:
             batch_size = user_batch_size
         else:
             if total_vram_gb >= 40:
-                batch_size = 512
+                batch_size = 1024
             elif total_vram_gb >= 24:
-                batch_size = 256
+                batch_size = 512
             elif total_vram_gb >= 16:
-                batch_size = 128
+                batch_size = 256
             else:
-                batch_size = 64
+                batch_size = 128
 
         hw_summary = (
             f"Hardware: {num_gpus}x {gpu_name} ({total_vram_gb:.1f} GB VRAM each) | {cpu_cores} CPU cores\n"
-            f">> Auto-Adjusted: workers_per_gpu={workers_per_gpu}, total_workers={num_workers}, "
+            f">> Configured: workers_per_gpu={workers_per_gpu}, total_workers={num_workers}, "
             f"cache_batch_size={cache_batch_size}, train_batch_size={batch_size} (in bfloat16/float16)"
         )
     else:
         num_workers = user_num_workers if (user_num_workers and user_num_workers > 0) else min(4, max(1, cpu_cores // 2))
         workers_per_gpu = 1
         batch_size = user_batch_size if (user_batch_size and user_batch_size > 0) else 16
-        cache_batch_size = 8
+        cache_batch_size = user_cache_batch_size if (user_cache_batch_size and user_cache_batch_size > 0) else 8
         hw_summary = (
             f"Hardware: CPU environment ({cpu_cores} cores)\n"
-            f">> Auto-Adjusted: CPU workers={num_workers}, cache_batch_size={cache_batch_size}, train_batch_size={batch_size}"
+            f">> Configured: CPU workers={num_workers}, cache_batch_size={cache_batch_size}, train_batch_size={batch_size}"
         )
 
     return {
@@ -244,12 +313,23 @@ def run_parallel_caching(files, cache_file, shards_dir=SHARDS_DIR, num_workers=N
     for sf in existing_shard_files:
         try:
             items = torch.load(sf, map_location="cpu")
+            shard_valid = True
             for item in items:
-                if len(item) == 3:
-                    orig_idx, t, tensor = item
-                else:
-                    orig_idx, tensor = item
-                existing_cached_items[orig_idx] = tensor
+                tensor = item[2] if len(item) == 3 else item[1]
+                # Official SmolVLA Paper strictly requires 576 dimensions (Layer 15)
+                if tensor.size(-1) != 576:
+                    shard_valid = False
+                    break
+            if shard_valid:
+                for item in items:
+                    orig_idx = item[0]
+                    tensor = item[2] if len(item) == 3 else item[1]
+                    existing_cached_items[orig_idx] = tensor
+            else:
+                try:
+                    os.remove(sf)
+                except OSError:
+                    pass
         except Exception:
             pass
 
@@ -422,11 +502,12 @@ def pad_collate_fn(batch):
     trajs = torch.stack(traj_list)
     return padded_raw, proprios, trajs
 
-def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_workers=None, workers_per_gpu=None, demosize=100):
+def train(epochs=200, batch_size=None, lr=1e-4, force_recache=False, num_workers=None, workers_per_gpu=None, demosize=100, cache_batch_size=None):
     hw = auto_detect_hardware_config(
         user_batch_size=batch_size,
         user_num_workers=num_workers,
-        user_workers_per_gpu=workers_per_gpu
+        user_workers_per_gpu=workers_per_gpu,
+        user_cache_batch_size=cache_batch_size
     )
     batch_size = hw["batch_size"]
     num_workers = hw["num_workers"]
@@ -457,11 +538,43 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
         policy = nn.DataParallel(policy)
     policy.train()
 
-    trainable_params = [p for p in policy.parameters() if p.requires_grad]
-    print(f">> Trainable Policy Parameters: {sum(p.numel() for p in trainable_params):,}", flush=True)
+    # Partition parameters: Muon handles 2D+ matrix weights; AdamW handles 1D parameters (biases, norms, embeddings)
+    raw_policy = policy.module if isinstance(policy, nn.DataParallel) else policy
+    muon_params = []
+    adamw_params = []
+    for name, p in raw_policy.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim >= 2 and "pos_queries" not in name:
+            muon_params.append(p)
+        else:
+            adamw_params.append(p)
 
-    optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+    total_params = sum(p.numel() for p in raw_policy.parameters() if p.requires_grad)
+    print(f">> Trainable Policy Parameters: {total_params:,} (Muon: {sum(p.numel() for p in muon_params):,} params | AdamW: {sum(p.numel() for p in adamw_params):,} params)", flush=True)
+
+    # Muon optimizer for 2D matrix weights (stable orthogonal updates)
+    # Tuned for ~9.6M parameter Action Expert: lr=0.005 prevents late-epoch drift
+    muon_lr = 0.005
+    optimizer_muon = Muon(muon_params, lr=muon_lr, momentum=0.95) if muon_params else None
+
+    # AdamW optimizer for embeddings, biases, and normalization layers
+    optimizer_adamw = optim.AdamW(adamw_params, lr=lr, betas=(0.9, 0.95), weight_decay=1e-4) if adamw_params else None
+
+    warmup_epochs = max(1, min(5, epochs // 10))
+    schedulers = []
+    if optimizer_adamw is not None:
+        w_adamw = optim.lr_scheduler.LinearLR(optimizer_adamw, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+        c_adamw = optim.lr_scheduler.CosineAnnealingLR(optimizer_adamw, T_max=epochs - warmup_epochs, eta_min=2.5e-6)
+        sched_adamw = optim.lr_scheduler.SequentialLR(optimizer_adamw, schedulers=[w_adamw, c_adamw], milestones=[warmup_epochs])
+        schedulers.append(sched_adamw)
+
+    if optimizer_muon is not None:
+        w_muon = optim.lr_scheduler.LinearLR(optimizer_muon, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+        c_muon = optim.lr_scheduler.CosineAnnealingLR(optimizer_muon, T_max=epochs - warmup_epochs, eta_min=1e-5)
+        sched_muon = optim.lr_scheduler.SequentialLR(optimizer_muon, schedulers=[w_muon, c_muon], milestones=[warmup_epochs])
+        schedulers.append(sched_muon)
+
     loss_fn = nn.MSELoss(reduction='none')
 
     model_path = os.path.join(MODEL_DIR, "dobot_full_smolvla_policy.pth")
@@ -479,7 +592,10 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
                 x_1 = x_1.to(DEVICE)
 
                 B = raw_hidden.size(0)
-                optimizer.zero_grad(set_to_none=True)
+                if optimizer_muon:
+                    optimizer_muon.zero_grad(set_to_none=True)
+                if optimizer_adamw:
+                    optimizer_adamw.zero_grad(set_to_none=True)
 
                 # ---- DATA AUGMENTATION (COVARIATE SHIFT FIX) ----
                 # Inject a small random uniform noise (±1.5cm) into the starting proprioceptive state.
@@ -489,35 +605,48 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
                 proprio = proprio + proprio_noise
 
                 x_0 = torch.randn_like(x_1)
-                t = torch.rand(B, device=DEVICE)
+                # Official SmolVLA Paper Section 3.1: "we sample tau from a Beta distribution"
+                # Beta(1.5, 1.0) biases sampling toward middle/late trajectory refinement where grasping occurs
+                alpha_beta = torch.distributions.Beta(torch.tensor(1.5, device=DEVICE), torch.tensor(1.0, device=DEVICE))
+                t = alpha_beta.sample((B,)).clamp(1e-4, 1.0 - 1e-4)
                 t_expanded = t.view(B, 1, 1)
 
                 x_t = (1.0 - t_expanded) * x_0 + t_expanded * x_1
                 u_t = x_1 - x_0
 
                 # DataParallel splits the batch and handles vlm_proj + forward_from_embeddings
-                v_pred = policy(raw_hidden, proprio, x_t, t)
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32):
+                    v_pred = policy(raw_hidden, proprio, x_t, t)
+                    loss_raw = loss_fn(v_pred.float(), u_t)
+                    # Strengthen gripper commitment (index 3) to 3.5 to eliminate ambiguous grasp float outputs
+                    dim_weights = torch.tensor([1.2, 1.2, 1.5, 3.5], device=DEVICE).view(1, 1, 4)
+                    flow_loss = (loss_raw * dim_weights).mean()
 
-                loss_raw = loss_fn(v_pred, u_t)
-                dim_weights = torch.tensor([1.2, 1.2, 1.5, 2.5], device=DEVICE).view(1, 1, 4)
-                flow_loss = (loss_raw * dim_weights).mean()
+                if torch.isnan(flow_loss) or torch.isinf(flow_loss):
+                    print(f"\n[ALERT] NaN/Inf detected in batch loss! v_pred={torch.isnan(v_pred).any().item()}, raw_hidden={torch.isnan(raw_hidden).any().item()}, proprio={torch.isnan(proprio).any().item()}, u_t={torch.isnan(u_t).any().item()}", flush=True)
+                    continue
 
                 flow_loss.backward()
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
-                optimizer.step()
+                if optimizer_muon:
+                    optimizer_muon.step()
+                if optimizer_adamw:
+                    optimizer_adamw.step()
                 total_loss += flow_loss.item() * B
 
-            scheduler.step()
+            for s in schedulers:
+                s.step()
             avg_loss = total_loss / len(dataset)
 
-            if avg_loss < best_loss or epoch % 10 == 0:
-                best_loss = min(best_loss, avg_loss)
+            # Strictly save ONLY when a new global best loss is achieved
+            if avg_loss < best_loss:
+                best_loss = avg_loss
                 # Unwrap DataParallel before saving
                 model_to_save = policy.module if isinstance(policy, nn.DataParallel) else policy
                 filtered = {k: v for k, v in model_to_save.state_dict().items() if not k.startswith("smolvlm.")}
                 safe_save_model(filtered, model_path)
 
-            current_lr = scheduler.get_last_lr()[0]
+            current_lr = schedulers[0].get_last_lr()[0] if schedulers else lr
             epoch_pbar.set_postfix({
                 "OT_Loss": f"{avg_loss:.5f}",
                 "Best": f"{best_loss:.5f}",
@@ -530,9 +659,7 @@ def train(epochs=200, batch_size=None, lr=1.5e-3, force_recache=False, num_worke
         safe_save_model(filtered, model_path)
         return
 
-    filtered = {k: v for k, v in policy.state_dict().items() if not k.startswith("smolvlm.")}
-    safe_save_model(filtered, model_path)
-    print(f"\n[SUCCESS] Full SmolVLA Checkpoint saved -> {model_path}", flush=True)
+    print(f"\n[SUCCESS] Full SmolVLA Best Checkpoint preserved (Best OT_Loss: {best_loss:.5f}) -> {model_path}", flush=True)
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
@@ -540,10 +667,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Auto-Tuned Multi-GPU / Multi-Worker Parallel Training for Full SmolVLA")
     parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs (default: 200)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: auto-detected based on GPU VRAM)")
-    parser.add_argument("--lr", type=float, default=1.5e-3, help="Learning rate (default: 1.5e-3)")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (default: 1e-4, matching SmolVLA paper)")
     parser.add_argument("--recache", action="store_true", help="Force re-compute the SmolVLM multi-layer features")
     parser.add_argument("--num-workers", type=int, default=None, help="Total caching workers (default: auto-detected)")
     parser.add_argument("--workers-per-gpu", type=int, default=None, help="Workers per GPU (default: auto-detected)")
+    parser.add_argument("--cache-batch-size", type=int, default=None, help="Batch size for VLM feature caching extraction (default: auto-detected)")
     parser.add_argument("--demosize", type=int, default=100, help="Number of demos to auto-generate if missing (default: 100)")
     args, unknown = parser.parse_known_args()
 
@@ -557,5 +685,6 @@ if __name__ == "__main__":
         force_recache=args.recache,
         num_workers=args.num_workers,
         workers_per_gpu=args.workers_per_gpu,
-        demosize=args.demosize
+        demosize=args.demosize,
+        cache_batch_size=args.cache_batch_size
     )

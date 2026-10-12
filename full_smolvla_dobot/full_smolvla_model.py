@@ -41,8 +41,8 @@ class SABlock(nn.Module):
     def forward(self, x):
         q = self.norm1(x)
         L = q.size(1)
-        mask = torch.triu(torch.ones(L, L, device=x.device) * float('-inf'), diagonal=1)
-        attn_out, _ = self.attn(q, q, q, attn_mask=mask, is_causal=True)
+        mask = torch.triu(torch.ones(L, L, device=x.device, dtype=torch.bool), diagonal=1)
+        attn_out, _ = self.attn(q, q, q, attn_mask=mask)
         x = x + attn_out
         x = x + self.ffn(self.norm2(x))
         return x
@@ -107,12 +107,13 @@ class FullSmolVLAPolicy(nn.Module):
 
             d_vlm = getattr(self.smolvlm.config.text_config, "hidden_size", d_vlm)
 
-        # Official Paper: "we use a reduced hidden size of 0.75 * d for v_theta"
+        # Official SmolVLA Paper: Expert hidden size is 0.75 * d_vlm = 432
         self.d_model = int(0.75 * d_vlm) # 432
         
-        self.vlm_proj = nn.Sequential(
-            nn.LayerNorm(d_vlm),
-            nn.Linear(d_vlm, self.d_model)
+        # Linear projection: VLM hidden dimension (576) -> Action Expert (432)
+        self.vlm_proj_layer = nn.Sequential(
+            nn.LayerNorm(576),
+            nn.Linear(576, self.d_model)
         )
 
         self.proprio_proj = nn.Sequential(
@@ -162,6 +163,9 @@ class FullSmolVLAPolicy(nn.Module):
             return layer_hidden
 
         return self.vlm_proj(layer_hidden)
+
+    def vlm_proj(self, hidden):
+        return self.vlm_proj_layer(hidden)
 
     def forward(self, raw_hidden, proprio, x_t, t):
         vlm_tokens = self.vlm_proj(raw_hidden)
