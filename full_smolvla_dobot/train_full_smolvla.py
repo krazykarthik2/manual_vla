@@ -554,7 +554,8 @@ def train(epochs=200, batch_size=None, lr=1e-4, force_recache=False, num_workers
     print(f">> Trainable Policy Parameters: {total_params:,} (Muon: {sum(p.numel() for p in muon_params):,} params | AdamW: {sum(p.numel() for p in adamw_params):,} params)", flush=True)
 
     # Muon optimizer for 2D matrix weights (stable orthogonal updates)
-    muon_lr = 0.02
+    # Tuned for ~9.6M parameter Action Expert: lr=0.005 prevents late-epoch drift
+    muon_lr = 0.005
     optimizer_muon = Muon(muon_params, lr=muon_lr, momentum=0.95) if muon_params else None
 
     # AdamW optimizer for embeddings, biases, and normalization layers
@@ -570,7 +571,7 @@ def train(epochs=200, batch_size=None, lr=1e-4, force_recache=False, num_workers
 
     if optimizer_muon is not None:
         w_muon = optim.lr_scheduler.LinearLR(optimizer_muon, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
-        c_muon = optim.lr_scheduler.CosineAnnealingLR(optimizer_muon, T_max=epochs - warmup_epochs, eta_min=1e-4)
+        c_muon = optim.lr_scheduler.CosineAnnealingLR(optimizer_muon, T_max=epochs - warmup_epochs, eta_min=1e-5)
         sched_muon = optim.lr_scheduler.SequentialLR(optimizer_muon, schedulers=[w_muon, c_muon], milestones=[warmup_epochs])
         schedulers.append(sched_muon)
 
@@ -633,8 +634,9 @@ def train(epochs=200, batch_size=None, lr=1e-4, force_recache=False, num_workers
                 s.step()
             avg_loss = total_loss / len(dataset)
 
-            if avg_loss < best_loss or epoch % 10 == 0:
-                best_loss = min(best_loss, avg_loss)
+            # Strictly save ONLY when a new global best loss is achieved
+            if avg_loss < best_loss:
+                best_loss = avg_loss
                 # Unwrap DataParallel before saving
                 model_to_save = policy.module if isinstance(policy, nn.DataParallel) else policy
                 filtered = {k: v for k, v in model_to_save.state_dict().items() if not k.startswith("smolvlm.")}
@@ -653,9 +655,7 @@ def train(epochs=200, batch_size=None, lr=1e-4, force_recache=False, num_workers
         safe_save_model(filtered, model_path)
         return
 
-    filtered = {k: v for k, v in policy.state_dict().items() if not k.startswith("smolvlm.")}
-    safe_save_model(filtered, model_path)
-    print(f"\n[SUCCESS] Full SmolVLA Checkpoint saved -> {model_path}", flush=True)
+    print(f"\n[SUCCESS] Full SmolVLA Best Checkpoint preserved (Best OT_Loss: {best_loss:.5f}) -> {model_path}", flush=True)
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
